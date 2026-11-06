@@ -1,0 +1,79 @@
+diff --git a/src/auth.rs b/src/auth.rs
+index 13302ad..431d541 100644
+--- a/src/auth.rs
++++ b/src/auth.rs
+@@ -59,8 +59,10 @@ impl Credentials {
+             system_id: get("system_id"), token: get("token"), csrf: get("csrf"),
+             sign_key: Some(get("sign_key")).filter(|k| !k.is_empty()).unwrap_or_else(|| DEFAULT_SIGN_KEY.into()),
+         };
++        // Official macOS logins may have an empty system_id claim. The signed
++        // request builder already omits identifiers that are not present.
+         let missing: Vec<&str> = [("user_id", &creds.user_id), ("device_id", &creds.device_id), ("client_id", &creds.client_id),
+-            ("system_id", &creds.system_id), ("token", &creds.token), ("csrf", &creds.csrf), ("sign_key", &creds.sign_key)]
++            ("token", &creds.token), ("csrf", &creds.csrf), ("sign_key", &creds.sign_key)]
+             .iter().filter(|(_, v)| v.is_empty()).map(|(k, _)| *k).collect();
+         if missing.is_empty() { Ok(creds) } else { Err(format!("missing credential settings: {}", missing.join(", "))) }
+     }
+diff --git a/src/viewer/tools/cli.rs b/src/viewer/tools/cli.rs
+index f574e4f..d6c0e67 100644
+--- a/src/viewer/tools/cli.rs
++++ b/src/viewer/tools/cli.rs
+@@ -28,21 +28,33 @@ impl TerminalInput for terminal::Terminal {
+     async fn write(&self,id:u32,data:&[u8])->Result<(),String>{self.write(id,data).await}
+     async fn resize(&self,id:u32,cols:u16,rows:u16)->Result<(),String>{self.resize(id,cols,rows).await}
+ }
++
++/// Keep reads cancellable when the remote session exits. macOS does not let
++/// kqueue watch the synthetic /dev/tty descriptor, so poll nonblocking reads
++/// without creating a blocking stdin task that could hold runtime shutdown.
++async fn read_tty(input: &mut std::fs::File, buffer: &mut [u8]) -> std::io::Result<usize> {
++    loop {
++        match std::io::Read::read(input, buffer) {
++            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
++                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
++            }
++            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
++            result => return result,
++        }
++    }
++}
++
+ pub async fn terminal_loop(t:&impl TerminalInput,mut output:mpsc::Receiver<terminal::Event>,id:u32)->Result<(),String>{
+     async{
+         let _tty=Tty::raw()?;
+         use std::os::unix::fs::OpenOptionsExt;
+-        let input=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open("/dev/tty").map_err(|_|"Cannot open local TTY")?;
+-        let input=tokio::io::unix::AsyncFd::new(input).map_err(|_|"Cannot watch local TTY")?;let mut stdout=tokio::io::stdout();let mut buf=vec![0;16*1024];
++        let mut input=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open("/dev/tty").map_err(|_|"Cannot open local TTY")?;
++        let mut stdout=tokio::io::stdout();let mut buf=vec![0;16*1024];
+         let mut resize=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()).map_err(|_|"Cannot watch terminal size")?;
+         let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;
+         loop{tokio::select!{
+             _=terminate.recv()=>break,
+-            n=async {
+-                loop {let mut ready=input.readable().await?;
+-                    match ready.try_io(|fd|std::io::Read::read(&mut fd.get_ref(),&mut buf)){Ok(n)=>break n,Err(_)=>continue}
+-                }
+-            }=>{let n=n.map_err(|_|"TTY read failed")?;if n==0{break}t.write(id,&buf[..n]).await?;},
++            n=read_tty(&mut input,&mut buf)=>{let n=n.map_err(|_|"TTY read failed")?;if n==0{break}t.write(id,&buf[..n]).await?;},
+             _=resize.recv()=>{let(c,r)=size();t.resize(id,c,r).await?;},
+             e=output.recv()=>match e{
+                 Some(terminal::Event::Output{session,data})if session==id=>{stdout.write_all(&data).await.map_err(|_|"TTY write failed")?;stdout.flush().await.map_err(|_|"TTY flush failed")?;},
+diff --git a/src/viewer_main.rs b/src/viewer_main.rs
+index 06c3c35..7bf48e0 100644
+--- a/src/viewer_main.rs
++++ b/src/viewer_main.rs
+@@ -284,7 +284,12 @@ async fn tool_command(args:&[String])->Result<(),String>{
+             _=>Err("Tool windows require the GTK build".into())}};
+         tokio::pin!(operation);
+         let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;
+-        loop{tokio::select!{r=&mut operation=>break r,r=session.step()=>r?,_=terminate.recv()=>break Ok(()),_=tokio::signal::ctrl_c()=>break Ok(())}}
++        // Official Windows hosts require CONTROL heartbeats for tool peers too.
++        // Match the existing desktop loop so idle text terminals stay connected.
++        let mut heartbeat=tokio::time::interval(Duration::from_secs(1));
++        loop{tokio::select!{r=&mut operation=>break r,r=session.step()=>r?,
++            _=heartbeat.tick()=>if session.peer.observed.control_open.load(std::sync::atomic::Ordering::Acquire){session.peer.send_input(&viewer::input::Input::heartbeat()).await?;},
++            _=terminate.recv()=>break Ok(()),_=tokio::signal::ctrl_c()=>break Ok(())}}
+     }.await;
+     session.close().await;result
+ }

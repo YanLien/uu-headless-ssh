@@ -1,0 +1,6 @@
+{
+  "uu_device_id": "YOUR_UU_DEVICE_ID",
+  "ssh_host": "192.0.2.10",
+  "ssh_user": "linuxuser",
+  "ssh_port": 22
+}

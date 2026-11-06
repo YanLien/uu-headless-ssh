@@ -1,0 +1,10 @@
+config.json
+.env
+.env.*
+.build/
+bin/
+__pycache__/
+*.py[cod]
+*.log
+*.token
+.DS_Store

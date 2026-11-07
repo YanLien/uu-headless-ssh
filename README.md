@@ -65,7 +65,9 @@ python3 connect.py
 ```
 
 Codex 使用带 PTY 的命令工具启动交互模式，然后通过该工具的 stdin 发送 Linux 命令即可。
-`Ctrl+]` 断开本地入口。远端程序可能继续运行；结束远端工作时应先正常退出程序。
+默认入口新建的远端终端归本次任务所有。输入 `exit`、按 `Ctrl+]` 或关闭本地窗口时，程序会主动删除本次新建的会话。
+连接中断时也会尝试清理；原连接不可用时，只建立管理连接删除已确认的会话，不会另开 PowerShell。
+设备离线或网络不可达时无法保证立即删除，程序会报告未完成的清理和已确认的会话 ID。
 Linux 的 zsh 可能把整段输入当作粘贴；命令停留在输入行时，再单独发送一次回车。
 
 直接在 Ghostty 等本地终端进入 Windows PowerShell：
@@ -77,6 +79,22 @@ swift scripts/credentials.swift "$PWD/bin/uuremote-viewer" terminal "$uu_device_
 ```
 
 此入口停留在 Windows。输入 `exit` 正常结束远端 PowerShell。
+
+查看现有会话，不创建 PowerShell：
+
+```sh
+swift scripts/credentials.swift "$PWD/bin/uuremote-viewer" terminal-list "$uu_device_id"
+```
+
+用输出中的 `session_id` 接入已有会话：
+
+```sh
+swift scripts/credentials.swift "$PWD/bin/uuremote-viewer" terminal "$uu_device_id" SESSION_ID
+```
+
+接入已有会话后，断开时只分离连接，保留会话。需要保留正在运行的程序时，关闭本地窗口或用 `Ctrl+]` 断开；输入 `exit` 会由远端 shell 自身结束程序。
+终端管理命令还支持 `terminal-kill DEVICE SESSION_ID...`，用于明确结束选中的会话及其中的程序。
+自动清理只删除能确认由本次调用新建的会话，不会清空其他会话；多个会话同时新建导致归属不明时会报错。
 
 如连接意外结束，可在上面的 `swift` 命令前加 `UU_TERMINAL_DIAGNOSTICS=1`：
 
@@ -112,7 +130,8 @@ UU_TERMINAL_DIAGNOSTICS=1 swift scripts/credentials.swift \
 | `config.example.json` | 可提交的配置模板 |
 
 协议客户端来自 [VallierDev/uu-remote-linux](https://github.com/VallierDev/uu-remote-linux)，按固定提交构建。
-补丁处理 macOS 登录中允许为空的 `system_id`、`/dev/tty` 输入的 kqueue 兼容性，工具连接的 CONTROL 保活，以及分段信令在轮询被取消后仍能继续读取。
+补丁处理 macOS 登录中允许为空的 `system_id`、`/dev/tty` 输入兼容、CONTROL 保活、取消读取/写入时保留信令，以及任务会话的自动清理。
+信令按官方 `RefreshSignalTokenLoop` 的节奏请求 `refresh_reconnect_key`：首次及失败重试间隔 30 秒，成功后间隔 300 秒。返回凭据不写入磁盘或日志。
 Swift 启动器通过 `execv` 保持前台终端进程组，避免交互客户端被系统挂起。
 
 `config.json`、编译产物、构建目录和日志均由 `.gitignore` 排除。
@@ -127,7 +146,8 @@ python3 scripts/build.py --release
 ## 验证与限制
 
 已在 macOS + UU 4.46.0 → Windows / OpenSSH 9.5 → Ubuntu 24.04 的真实链路验证 SSH 和交互式终端。
-适配时运行了上游认证与终端/转发测试；新增回归模拟分段信令读取被反复取消，并验证分段期间的心跳响应。
+适配时运行了上游认证与终端/转发测试。新增本地回归覆盖房间续期、读写取消、任务结束删除、已有会话分离，以及 Python 在清理完成前保持 PTY 存活。
+本地模拟验证不代表长时间实机连接已通过；信令房间仍可能由服务端主动关闭。
 
 上游回归测试命令（在 `.build/upstream` 中运行）：
 
@@ -135,7 +155,10 @@ python3 scripts/build.py --release
 cargo test --locked --features native-viewer --bin uuremote-viewer auth::
 cargo test --locked --features native-viewer --bin uuremote-viewer viewer::tools::tests::
 cargo test --locked --features native-viewer --bin uuremote-viewer viewer::tests:: -- --test-threads=1
+cargo test --locked --features native-viewer --bin uuremote-viewer viewer::signal::tests:: -- --test-threads=1
 ```
+
+本仓库的本地进程退出测试：`python3 -m unittest discover -s tests -v`。
 
 这是第三方协议兼容实现，与网易无关联。当前凭据读取针对已验证的 macOS UU 版本；UU 更新后需要重新验证。
 `--check` 输出简短身份信息，交互模式传递终端控制序列；本工具没有实现任意长输出的结构化远程执行接口。

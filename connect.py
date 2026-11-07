@@ -20,6 +20,37 @@ ROOT = Path(__file__).resolve().parent
 ANSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
 
+def stop_client(pid, master, forward=False, grace=30):
+    """Keep the PTY alive while the client deletes its owned remote terminal."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + grace
+    can_read = True
+    while True:
+        finished, status = os.waitpid(pid, os.WNOHANG)
+        if finished:
+            return os.waitstatus_to_exitcode(status)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            os.kill(pid, signal.SIGKILL)
+            return os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+        ready, _, _ = select.select([master] if can_read else [], [], [], min(0.2, remaining))
+        if ready:
+            try:
+                block = os.read(master, 65536)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                block = b""
+            if not block:
+                can_read = False
+            if forward and block:
+                sys.stdout.buffer.write(block)
+                sys.stdout.buffer.flush()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="Verify B-to-C SSH and return JSON.")
@@ -50,7 +81,6 @@ def main():
     data = bytearray()
     sent = False
     expired = False
-    detached = False
     deadline = time.monotonic() + 35
     target = f"{user}@{host}"
     ssh = f"ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=8 -p {port}"
@@ -91,31 +121,31 @@ def main():
             if not args.check and 0 in ready:
                 block = os.read(0, 16384)
                 if not block or b"\x1d" in block:
-                    detached = True
                     break
                 os.write(master, block)
     finally:
         if saved is not None:
             termios.tcsetattr(0, termios.TCSADRAIN, saved)
         try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        os.close(master)
-        os.waitpid(pid, 0)
+            child_status = stop_client(pid, master, forward=not args.check)
+        finally:
+            os.close(master)
 
     if args.check:
         text = ANSI.sub(b"", bytes(data))
         identity = re.search(rb"(?:\r?\n)([A-Za-z0-9_.-]+)\r?\n([A-Za-z0-9_.-]+)\r?\nLinux\r?\n", text)
-        success = not expired and b"__UU_CHECK_0__" in text and identity is not None
+        verified = b"__UU_CHECK_0__" in text and identity is not None
+        success = not expired and verified and child_status == 0
         report = {"ok": success, "via_uu_device": device, "ssh_target": target}
         if success:
             report.update(hostname=identity[1].decode(), user=identity[2].decode(), system="Linux", ssh_exit_code=0)
         else:
-            report["error"] = "Timed out" if expired else "SSH identity verification failed"
+            report["error"] = ("Timed out" if expired else "UU client exited with an error"
+                               if verified else "SSH identity verification failed")
+            report["client_exit_code"] = child_status
         print(json.dumps(report, ensure_ascii=False))
         return 0 if success else 1
-    return 0 if detached else 1
+    return child_status if child_status >= 0 else 128 - child_status
 
 
 if __name__ == "__main__":

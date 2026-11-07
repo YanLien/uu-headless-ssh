@@ -33,10 +33,20 @@ index e850812138da1cb686b488a7c43bdc9ff84fb4c6..afa956c44c5492814f5c39680b630628
                      _=>{},
                  }
 diff --git a/src/viewer/signal.rs b/src/viewer/signal.rs
-index b87d872b959209dac4e126a1892312e8a9cd267a..d55cd5fef9144c9afcaa650f0b6482d43406dbdd 100644
+index b87d872b959209dac4e126a1892312e8a9cd267a..9882c28966db37477c1766affbb4945eb611772b 100644
 --- a/src/viewer/signal.rs
 +++ b/src/viewer/signal.rs
-@@ -8,10 +8,18 @@ use std::{collections::VecDeque,time::Duration};
+@@ -1,17 +1,39 @@
+ //! Framing/ack evidence: internal viewer-evidence-20261016.md section 3.
+ //! Raw Engine.IO4 attachments and legacy SDK 0x04 framing are explicit alternatives.
+ use base64::Engine as _;
+-use futures_util::{SinkExt, StreamExt};
++use futures_util::{Sink, SinkExt, StreamExt};
+ use serde_json::Value;
+ use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+-use std::{collections::VecDeque,time::Duration};
++use std::{collections::VecDeque,pin::Pin,time::Duration};
++use tokio::time::Instant;
  
  pub struct Signal {
      ws: crate::ws_transport::Socket,
@@ -50,12 +60,25 @@ index b87d872b959209dac4e126a1892312e8a9cd267a..d55cd5fef9144c9afcaa650f0b6482d4
 +    /// A binary header may arrive before a heartbeat cancels event polling.
 +    /// Retain it and any completed attachments until the whole packet arrives.
 +    binary:Option<BinaryPacket>,
++
++    /// Retain unsent messages when a heartbeat cancels the caller's future.
++    outbox:VecDeque<Message>,
++
++    refresh:Refresh,
++
++    started:Instant,
++
++    pings:u64,
++
++    pong_queued:u64,
++
++    last_ping:Instant,
  }
 +
  impl Signal {
      pub async fn connect(urls:&[String], token:&str, timeout:Duration, legacy_prefix:bool)->Result<Self,String> {
          for url in urls {
-@@ -19,11 +27,12 @@ impl Signal {
+@@ -19,26 +41,68 @@ impl Signal {
          }
          Err("Signaling connection failed (details omitted)".into())
      }
@@ -65,29 +88,103 @@ index b87d872b959209dac4e126a1892312e8a9cd267a..d55cd5fef9144c9afcaa650f0b6482d4
          request.headers_mut().insert("X-NRD-AUTH",token.parse().map_err(|_|"Invalid room authentication header")?);
          let ws=crate::ws_transport::connect(request,timeout).await?;
 -        let mut s=Self{ws,next_ack:10,pending:VecDeque::new(),legacy_prefix};
-+        let mut s=Self{ws,next_ack:10,pending:VecDeque::new(),legacy_prefix,binary:None};
++        let now=Instant::now();
++        let mut s=Self{ws,next_ack:10,pending:VecDeque::new(),legacy_prefix,binary:None,
++            outbox:VecDeque::new(),refresh:Refresh::new(now),started:now,pings:0,pong_queued:0,last_ping:now};
          let mut opened=false;
          loop {
              match s.ws.next().await {
-@@ -38,7 +47,9 @@ impl Signal {
+                 Some(Ok(Message::Text(t))) if t.starts_with('0') && !opened => {
+-                    serde_json::from_str::<Value>(&t[1..]).map_err(|_|"Invalid Engine.IO open")?;
++                    let open=serde_json::from_str::<Value>(&t[1..]).map_err(|_|"Invalid Engine.IO open")?;
++                    log::info!("Viewer signaling heartbeat config: ping_interval_ms={:?} ping_timeout_ms={:?}",
++                        open.get("pingInterval").and_then(Value::as_u64),open.get("pingTimeout").and_then(Value::as_u64));
+                     opened=true;s.send(Message::Text("40".into())).await?;
+                 }
+-                Some(Ok(Message::Text(t))) if t.starts_with("40") && opened =>return Ok(s),
++                Some(Ok(Message::Text(t))) if t.starts_with("40") && opened => {
++                    s.refresh.next=Instant::now()+Duration::from_secs(30);
++                    return Ok(s)
++                },
+                 Some(Ok(Message::Text(t))) if t.starts_with('2')=>s.send(Message::Text(format!("3{}",&t[1..]))).await?,
+                 Some(Ok(Message::Ping(b)))=>s.send(Message::Pong(b)).await?,
+                 _=>return Err("Signaling handshake failed".into()),
              }
          }
      }
+-    async fn send(&mut self,message:Message)->Result<(),String> {self.ws.send(message).await.map_err(|_|"Signaling send failed".into())}
 +
-     async fn send(&mut self,message:Message)->Result<(),String> {self.ws.send(message).await.map_err(|_|"Signaling send failed".into())}
++    async fn send(&mut self,message:Message)->Result<(),String> {
++        if self.outbox.len()>=512 {return Err("Too many pending signaling messages".into())}
++        if matches!(&message,Message::Text(text) if text.starts_with('3')) {self.pong_queued+=1;}
++        self.outbox.push_back(message);
++        flush_outbox(&mut self.ws,&mut self.outbox).await
++    }
++
++    async fn refresh_key(&mut self)->Result<(),String> {
++        self.next_ack+=1;
++        let id=self.next_ack;
++        self.refresh.request(id,Instant::now());
++        // Official libstreamer RefreshSignalTokenLoop emits this event without
++        // payload arguments: first/retry after 30s, success every 300s. See also
++        // src/signaling.rs and docs/release-notes/v0.1.5.md for the same wire form.
++        log::info!("Viewer reconnect-key refresh requested: age_s={}",self.started.elapsed().as_secs());
++        self.send(Message::Text(format!("42{id}[\"refresh_reconnect_key\"]"))).await
++    }
++
++    fn accept_packet(&mut self,packet:Packet)->Option<Packet> {
++        if let Packet::Ack(id,value)=&packet {
++            if self.refresh.acknowledge(*id,value,Instant::now()) {
++                log::info!("Viewer reconnect-key refresh acknowledged: age_s={} accepted={}",
++                    self.started.elapsed().as_secs(),self.refresh.accepted==*id);
++                return None
++            }
++        }
++        Some(packet)
++    }
++
++    fn closed(&self,kind:&str) {
++        log::info!("Viewer signaling closed: kind={} age_s={} pings={} pong_queued={} last_ping_gap_s={} refresh_success={}",
++            kind,self.started.elapsed().as_secs(),self.pings,self.pong_queued,self.last_ping.elapsed().as_secs(),self.refresh.accepted!=0);
++    }
 +
      pub async fn control(&mut self, header:Value, app_data:Vec<u8>, timeout:Duration)->Result<Value,String> {
          self.next_ack+=1;let id=self.next_ack;
          self.send(Message::Text(format!("451-{id}{}",serde_json::json!(["control",header])))).await?;
-@@ -61,6 +72,7 @@ impl Signal {
+@@ -61,64 +125,66 @@ impl Signal {
              }
          }).await.map_err(|_|"Control acknowledgement timed out")?
      }
 +
      async fn packet(&mut self)->Result<Packet,String> {
          loop {
-             match self.ws.next().await {
-@@ -77,45 +89,23 @@ impl Signal {
+-            match self.ws.next().await {
+-                Some(Ok(Message::Text(t))) if t.starts_with('2')=>self.send(Message::Text(format!("3{}",&t[1..]))).await?,
++            // A previous caller may have been canceled after queuing a pong or
++            // ICE candidate. Flush it before waiting for another inbound frame.
++            flush_outbox(&mut self.ws,&mut self.outbox).await?;
++            let message=tokio::select! {
++                _=tokio::time::sleep_until(self.refresh.next)=>{self.refresh_key().await?;continue;},
++                message=self.ws.next()=>message,
++            };
++            match message {
++                Some(Ok(Message::Text(t))) if t.starts_with('2')=> {
++                    self.pings+=1;self.last_ping=Instant::now();
++                    self.send(Message::Text(format!("3{}",&t[1..]))).await?;
++                    if self.pings==1 || self.pings%12==0 {
++                        log::info!("Viewer signaling heartbeat: age_s={} pings={} pong_queued={}",self.started.elapsed().as_secs(),self.pings,self.pong_queued);
++                    }
++                },
+                 Some(Ok(Message::Ping(b)))=>self.send(Message::Pong(b)).await?,
+                 Some(Ok(Message::Text(t))) if t.starts_with("43")=> {
+                     let begin=t.find('[').ok_or("Malformed signaling acknowledgement")?;
+                     let id=t[2..begin].parse().map_err(|_|"Malformed signaling acknowledgement id")?;
+                     let value=serde_json::from_str(&t[begin..]).map_err(|_|"Malformed signaling acknowledgement body")?;
+-                    return Ok(Packet::Ack(id,value))
++                    if let Some(packet)=self.accept_packet(Packet::Ack(id,value)){return Ok(packet)}
+                 }
+                 Some(Ok(Message::Text(t))) if t.starts_with("42")=> {
+                     let begin=t.find('[').ok_or("Malformed signaling event")?;
                      let value=serde_json::from_str(&t[begin..]).map_err(|_|"Malformed signaling event body")?;
                      return Ok(Packet::Event(value))
                  }
@@ -125,15 +222,17 @@ index b87d872b959209dac4e126a1892312e8a9cd267a..d55cd5fef9144c9afcaa650f0b6482d4
 -                            serde_json::Value::Array(l)=>for x in l{fill(x,a)},
 -                            _=>{},
 -                        }
--                    }
++                    if self.binary.is_some(){return Err("Overlapping binary signaling packets".into())}
++                    let packet=BinaryPacket::header(&t)?;
++                    if packet.count==0 {
++                        if let Some(packet)=self.accept_packet(packet.finish()){return Ok(packet)}
++                        continue;
+                     }
 -                    fill(&mut value,&attachments);
 -                    log::info!("Viewer binary signaling event: name={} attachments={}",value.get(0).and_then(|v|v.as_str()).unwrap_or("-"),count);
 -                    if t.starts_with("46") {
 -                        let id=t[dash+1..begin].parse().map_err(|_|"Malformed binary acknowledgement id")?;
 -                        return Ok(Packet::Ack(id,value))
-+                    if self.binary.is_some(){return Err("Overlapping binary signaling packets".into())}
-+                    let packet=BinaryPacket::header(&t)?;
-+                    if packet.count==0 {return Ok(packet.finish())}
 +                    self.binary=Some(packet);
 +                }
 +                Some(Ok(Message::Binary(mut b))) if self.binary.is_some()=> {
@@ -142,13 +241,25 @@ index b87d872b959209dac4e126a1892312e8a9cd267a..d55cd5fef9144c9afcaa650f0b6482d4
 +                    let packet=self.binary.as_mut().unwrap();
 +                    packet.attachments.push(base64::engine::general_purpose::STANDARD.encode(&b));
 +                    if packet.attachments.len()==packet.count {
-+                        return Ok(self.binary.take().unwrap().finish())
++                        let packet=self.binary.take().unwrap().finish();
++                        if let Some(packet)=self.accept_packet(packet){return Ok(packet)}
                      }
 -                    return Ok(Packet::Event(value))
                  }
-                 Some(Ok(Message::Text(t))) if t=="41" || t=="1"=>return Err("Signaling room closed".into()),
-                 Some(Ok(Message::Close(_)))|None|Some(Err(_))=>return Err("Signaling disconnected".into()),
-@@ -126,11 +116,59 @@ impl Signal {
+-                Some(Ok(Message::Text(t))) if t=="41" || t=="1"=>return Err("Signaling room closed".into()),
+-                Some(Ok(Message::Close(_)))|None|Some(Err(_))=>return Err("Signaling disconnected".into()),
++                Some(Ok(Message::Text(t))) if t=="41" || t=="1"=> {
++                    self.closed(if t=="41"{"socket_io_disconnect"}else{"engine_io_close"});
++                    return Err("Signaling room closed".into())
++                },
++                Some(Ok(Message::Close(_)))|None|Some(Err(_))=> {
++                    self.closed("websocket_disconnected");
++                    return Err("Signaling disconnected".into())
++                },
+                 // Type, short prefix and length only, to see what else the room delivers.
+                 Some(Ok(Message::Text(t)))=>log::info!("Viewer signaling frame ignored: text prefix={} bytes={}",t.chars().take(3).collect::<String>(),t.len()),
+                 Some(Ok(Message::Binary(b)))=>log::info!("Viewer signaling frame ignored: binary bytes={}",b.len()),
+@@ -126,11 +192,242 @@ impl Signal {
              }
          }
      }
@@ -206,6 +317,189 @@ index b87d872b959209dac4e126a1892312e8a9cd267a..d55cd5fef9144c9afcaa650f0b6482d4
 +        fill(&mut self.value,&self.attachments);
 +        log::info!("Viewer binary signaling packet: attachments={} acknowledgement={}",self.count,self.ack.is_some());
 +        match self.ack {Some(id)=>Packet::Ack(id,self.value),None=>Packet::Event(self.value)}
++    }
++}
++
++/// Commit a queued frame only after the sink is ready. There is no await between
++/// dequeue and start_send; cancellation during flush leaves the frame in the sink.
++pub(super) async fn flush_outbox<S:Sink<Message>+Unpin>(socket:&mut S,outbox:&mut VecDeque<Message>)->Result<(),String> {
++    while !outbox.is_empty() {
++        futures_util::future::poll_fn(|context|Pin::new(&mut *socket).poll_ready(context))
++            .await.map_err(|_|"Signaling send failed")?;
++        let message=outbox.pop_front().unwrap();
++        Pin::new(&mut *socket).start_send(message).map_err(|_|"Signaling send failed")?;
++    }
++    socket.flush().await.map_err(|_|"Signaling send failed".into())
++}
++
++/// Room renewal follows the official native session's schedule. Only ack ids
++/// and deadlines are retained; the returned reconnect credential is never stored.
++struct Refresh {
++    next:Instant,
++
++    pending:VecDeque<u64>,
++
++    accepted:u64,
++}
++
++impl Refresh {
++    fn new(now:Instant)->Self {
++        Self{next:now+Duration::from_secs(30),pending:VecDeque::new(),accepted:0}
++    }
++
++    fn request(&mut self,id:u64,now:Instant) {
++        self.pending.push_back(id);
++        if self.pending.len()>16 {self.pending.pop_front();}
++        self.next=now+Duration::from_secs(30);
++    }
++
++    fn acknowledge(&mut self,id:u64,value:&Value,now:Instant)->bool {
++        if !self.pending.contains(&id){return false}
++        self.pending.retain(|pending|*pending!=id);
++        let valid=value.as_array().is_some_and(|ack| {
++            ack.first().and_then(Value::as_str)==Some("success") && ack.get(1).and_then(|body|body.get("reconnect_key"))
++                .and_then(Value::as_str).is_some_and(|key|!key.is_empty() && key.len()<=16384)
++        });
++        if valid && id>self.accepted {
++            self.accepted=id;
++            self.next=now+Duration::from_secs(300);
++        }
++        true
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::task::{Context,Poll};
++    use tokio::net::TcpListener;
++    use tokio_tungstenite::accept_async;
++    use serde_json::json;
++
++    /// Replace sink readiness and flushing with explicit stalls. Accepted frames
++    /// are real ordered writes to this fixture, without network/socket timing.
++    struct StalledSink {
++        ready:bool,
++
++        flush_ready:bool,
++
++        accepted:Vec<Message>,
++    }
++
++    impl Sink<Message> for StalledSink {
++        type Error=();
++
++        fn poll_ready(self:Pin<&mut Self>,_:&mut Context<'_>)->Poll<Result<(),()>> {
++            if self.ready {Poll::Ready(Ok(()))} else {Poll::Pending}
++        }
++
++        fn start_send(mut self:Pin<&mut Self>,message:Message)->Result<(),()> {
++            self.accepted.push(message);Ok(())
++        }
++
++        fn poll_flush(self:Pin<&mut Self>,_:&mut Context<'_>)->Poll<Result<(),()>> {
++            if self.flush_ready {Poll::Ready(Ok(()))} else {Poll::Pending}
++        }
++
++        fn poll_close(self:Pin<&mut Self>,_:&mut Context<'_>)->Poll<Result<(),()>> {
++            Poll::Ready(Ok(()))
++        }
++    }
++
++    /// Cancel both before a write is accepted and after it is buffered. Retrying
++    /// must deliver each frame once and retain the order of pong and ICE data.
++    #[tokio::test]
++    async fn canceled_writes_keep_queued_and_buffered_frames() {
++        let expected=vec![Message::Text("3fixture".into()),Message::Text("42[\"soac\",{}]".into())];
++        let mut queue=VecDeque::from(expected.clone());
++        let mut sink=StalledSink{ready:false,flush_ready:false,accepted:Vec::new()};
++
++        assert!(tokio::time::timeout(Duration::from_millis(5),flush_outbox(&mut sink,&mut queue)).await.is_err());
++        assert_eq!(queue.len(),2);
++        assert!(sink.accepted.is_empty());
++        sink.ready=true;
++        assert!(tokio::time::timeout(Duration::from_millis(5),flush_outbox(&mut sink,&mut queue)).await.is_err());
++        assert!(queue.is_empty());
++        assert_eq!(sink.accepted,expected);
++
++        sink.flush_ready=true;
++        flush_outbox(&mut sink,&mut queue).await.unwrap();
++        assert_eq!(sink.accepted,expected,"a canceled flush must not enqueue a duplicate pong");
++    }
++
++    /// Only a successful renewal with a valid key may defer the next request for
++    /// five minutes; stale replies and failure replies must retain retry timing.
++    #[tokio::test]
++    async fn refresh_schedule_retries_failures_and_rejects_stale_acknowledgements() {
++        let now=Instant::now();
++        let mut refresh=Refresh::new(now);
++        assert_eq!(refresh.next,now+Duration::from_secs(30));
++        refresh.request(11,now+Duration::from_secs(30));
++        assert_eq!(refresh.next,now+Duration::from_secs(60));
++        assert!(!refresh.acknowledge(99,&json!(["success",{"reconnect_key":"synthetic"}]),now));
++        assert!(refresh.acknowledge(11,&json!(["failure",{}]),now+Duration::from_secs(31)));
++        assert_eq!(refresh.next,now+Duration::from_secs(60));
++
++        refresh.request(12,now+Duration::from_secs(60));
++        refresh.request(13,now+Duration::from_secs(90));
++        assert!(refresh.acknowledge(13,&json!(["success",{"reconnect_key":"synthetic"}]),now+Duration::from_secs(91)));
++        let deadline=now+Duration::from_secs(391);
++        assert_eq!(refresh.next,deadline);
++        assert!(refresh.acknowledge(12,&json!(["success",{"reconnect_key":"older"}]),now+Duration::from_secs(92)));
++        assert_eq!(refresh.next,deadline);
++        assert_eq!(refresh.accepted,13);
++    }
++
++    /// Exercise the actual Socket.IO request and acknowledgement on a loopback
++    /// WebSocket. Accelerate only the renewal deadline, without creating a peer.
++    #[tokio::test]
++    async fn refresh_uses_empty_arguments_and_consumes_its_own_ack() {
++        tokio::time::timeout(Duration::from_secs(5),async {
++            let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();
++            let url=format!("ws://{}",listener.local_addr().unwrap());
++            let server=tokio::spawn(async move {
++                let (stream,_)=listener.accept().await.unwrap();
++                let mut socket=accept_async(stream).await.unwrap();
++                socket.send(Message::Text("0{}".into())).await.unwrap();
++                assert_eq!(socket.next().await.unwrap().unwrap(),Message::Text("40".into()));
++                socket.send(Message::Text("40{}".into())).await.unwrap();
++                assert_eq!(socket.next().await.unwrap().unwrap(),Message::Text("4211[\"refresh_reconnect_key\"]".into()));
++                socket.send(Message::Text("4311[\"success\",{\"reconnect_key\":\"synthetic\"}]".into())).await.unwrap();
++                socket.send(Message::Text("42[\"fixture\",{}]".into())).await.unwrap();
++                while socket.next().await.is_some() {}
++            });
++            let mut signal=Signal::connect(&[url],"synthetic-ticket",Duration::from_secs(2),false).await.unwrap();
++            signal.refresh.next=Instant::now();
++            assert_eq!(signal.event().await.unwrap(),json!(["fixture",{}]));
++            assert_eq!(signal.refresh.accepted,11);
++            assert!(signal.refresh.pending.is_empty());
++            assert!(signal.refresh.next>Instant::now()+Duration::from_secs(299));
++            signal.close().await;
++            server.await.unwrap();
++        }).await.expect("refresh exchange timed out");
++    }
++
++    /// Server-issued room closures still terminate the connection; renewal never
++    /// turns an explicit disconnect into an automatic fresh control session.
++    #[tokio::test]
++    async fn explicit_room_closures_are_preserved() {
++        for close in ["1","41"] {
++            let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();
++            let url=format!("ws://{}",listener.local_addr().unwrap());
++            let server=tokio::spawn(async move {
++                let (stream,_)=listener.accept().await.unwrap();
++                let mut socket=accept_async(stream).await.unwrap();
++                socket.send(Message::Text("0{}".into())).await.unwrap();
++                assert_eq!(socket.next().await.unwrap().unwrap(),Message::Text("40".into()));
++                socket.send(Message::Text("40{}".into())).await.unwrap();
++                socket.send(Message::Text(close.into())).await.unwrap();
++                while socket.next().await.is_some() {}
++            });
++            let mut signal=Signal::connect(&[url],"synthetic-ticket",Duration::from_secs(2),false).await.unwrap();
++            assert_eq!(signal.event().await.unwrap_err(),"Signaling room closed");
++            signal.close().await;
++            server.await.unwrap();
++        }
 +    }
 +}
 diff --git a/src/viewer/tests.rs b/src/viewer/tests.rs
@@ -307,10 +601,32 @@ index 5cc95bb0116d52c45997e1ee050ae71dc18630a1..8b35928c612c5a5fbd17d4f049eb1f93
  async fn complete_session_uses_loopback_signaling_and_virtual_rtc_through_echo() {
      tokio::time::timeout(Duration::from_secs(20),async {
 diff --git a/src/viewer/tools/cli.rs b/src/viewer/tools/cli.rs
-index f574e4fbe66ccbbc662bccae2db9502379d9d638..d6c0e671feb9fe9dbbecec87c242e7b5c30137e9 100644
+index f574e4fbe66ccbbc662bccae2db9502379d9d638..469168af47cb4fd1252a992eafd483b91b7de32d 100644
 --- a/src/viewer/tools/cli.rs
 +++ b/src/viewer/tools/cli.rs
-@@ -28,21 +28,33 @@ impl TerminalInput for terminal::Terminal {
+@@ -13,10 +13,17 @@ impl Tty {
+ }
+ impl Drop for Tty {fn drop(&mut self){unsafe{libc::tcsetattr(self.fd,libc::TCSANOW,&self.saved);}}}
+ pub fn size()->(u16,u16){let mut w:libc::winsize=unsafe{std::mem::zeroed()};if unsafe{libc::ioctl(0,libc::TIOCGWINSZ as _,&mut w)}==0{(w.ws_col.max(1),w.ws_row.max(1))}else{(80,24)}}
+-pub async fn terminal(io:Transport,rx:mpsc::Receiver<Packet>,session:Option<u32>)->Result<(),String>{
+-    let(t,output)=terminal::Terminal::new(io,rx);t.check_env().await?;
+-    let(c,r)=size();let id=match session{Some(id)=>t.attach(id,c,r).await?,None=>t.open(c,r).await?};
+-    let result=terminal_loop(&t,output,id).await;let _=t.close(id).await;result
++pub async fn terminal(io:Transport,rx:mpsc::Receiver<Packet>,session:Option<u32>,cleanup:lifecycle::Cleanup)->Result<(),String>{
++    let (terminal,output)=terminal::Terminal::new(io,rx);
++    let terminal=Arc::new(terminal);
++    terminal.check_env().await?;
++    let before=if session.is_none(){terminal.list_sessions().await?}else{Vec::new()};
++    cleanup.track(terminal.clone(),session.is_some(),&before);
++    let (cols,rows)=size();
++    let id=match session {Some(id)=>terminal.attach(id,cols,rows).await?,None=>terminal.open(cols,rows).await?};
++    cleanup.opened(id);
++    cleanup.identify().await?;
++    terminal_loop(terminal.as_ref(),output,id).await
+ }
+ #[async_trait::async_trait]
+ pub trait TerminalInput:Sync {
+@@ -28,21 +35,33 @@ impl TerminalInput for terminal::Terminal {
      async fn write(&self,id:u32,data:&[u8])->Result<(),String>{self.write(id,data).await}
      async fn resize(&self,id:u32,cols:u16,rows:u16)->Result<(),String>{self.resize(id,cols,rows).await}
  }
@@ -351,15 +667,475 @@ index f574e4fbe66ccbbc662bccae2db9502379d9d638..d6c0e671feb9fe9dbbecec87c242e7b5
              _=resize.recv()=>{let(c,r)=size();t.resize(id,c,r).await?;},
              e=output.recv()=>match e{
                  Some(terminal::Event::Output{session,data})if session==id=>{stdout.write_all(&data).await.map_err(|_|"TTY write failed")?;stdout.flush().await.map_err(|_|"TTY flush failed")?;},
+@@ -71,3 +90,23 @@ pub async fn portmap(io:Transport,rx:mpsc::Receiver<Packet>,local:u16,host:&str,
+     let result=tokio::select!{r=tokio::signal::ctrl_c()=>r.map_err(|_|"Cannot watch interrupt".to_owned()),_=p.closed()=>Err("Forwarding transport closed".into())};
+     p.remove_rule(id).await?;result
+ }
++
++/// Inspect or terminate an identified session without sending OPEN. In particular,
++/// a list request must never allocate another remote shell during cleanup.
++pub async fn terminal_manage(io:Transport,rx:mpsc::Receiver<Packet>,kill:&[u32])->Result<(),String> {
++    let (terminal,_events)=terminal::Terminal::new(io,rx);
++    if kill.is_empty() {
++        println!("{}",serde_json::json!(terminal.list_sessions().await?));
++    } else {
++        let sessions=terminal.list_sessions().await?;
++        for id in kill {
++            if sessions.iter().any(|session|session["session_id"].as_u64()==Some(*id as u64)) {
++                if let Err(error)=terminal.kill(*id).await {
++                    if terminal.list_sessions().await?.iter().any(|session|session["session_id"].as_u64()==Some(*id as u64)){return Err(error)}
++                }
++            }
++            println!("{}",serde_json::json!({"killed":id}));
++        }
++    }
++    Ok(())
++}
+diff --git a/src/viewer/tools/lifecycle.rs b/src/viewer/tools/lifecycle.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f353f58fed1778dad8bf9c1b0b98b24282838202
+--- /dev/null
++++ b/src/viewer/tools/lifecycle.rs
+@@ -0,0 +1,142 @@
++//! A terminal created for one command belongs to that command. Keep cleanup
++//! outside its cancellable I/O future so signaling errors cannot skip deletion.
++use super::terminal::Terminal;
++use serde_json::Value;
++use std::{
++    collections::HashSet,
++    sync::{Arc, Mutex},
++};
++
++#[derive(Clone, Default)]
++pub struct Cleanup(Arc<Mutex<Option<Tracked>>>);
++
++struct Tracked {
++    terminal: Arc<Terminal>,
++
++    /// Session ids observed before OPEN; they can never become owned here.
++    before: HashSet<u32>,
++
++    /// Explicit attachment, or an OPEN reply that reused a preexisting id.
++    existing: bool,
++
++    /// Wire id can be zero on Windows, even though LIST exposes a stable id.
++    wire: Option<u32>,
++
++    /// Stable LIST id confirmed to have been created by this invocation.
++    owned: Option<u32>,
++}
++
++fn ids(rows: &[Value]) -> HashSet<u32> {
++    rows.iter()
++        .filter_map(|row| {
++            row["session_id"]
++                .as_u64()
++                .and_then(|id| u32::try_from(id).ok())
++                .filter(|id| *id != 0)
++        })
++        .collect()
++}
++
++impl Cleanup {
++    /// Register the pre-OPEN inventory and retain the worker across cancellation.
++    pub fn track(&self, terminal: Arc<Terminal>, existing: bool, before: &[Value]) {
++        *self.0.lock().unwrap() = Some(Tracked {
++            terminal,
++            before: ids(before),
++            existing,
++            wire: None,
++            owned: None,
++        });
++    }
++
++    /// Record a successful OPEN acknowledgement before any further await.
++    pub fn opened(&self, id: u32) {
++        if let Some(tracked) = self.0.lock().unwrap().as_mut() {
++            tracked.wire = Some(id);
++            if !tracked.existing && id != 0 {
++                if tracked.before.contains(&id) {
++                    tracked.existing = true;
++                } else {
++                    tracked.owned = Some(id);
++                }
++            }
++        }
++    }
++
++    /// Return only a confirmed owned id for cleanup over a fresh management peer.
++    pub fn owned(&self) -> Option<u32> {
++        self.0
++            .lock()
++            .unwrap()
++            .as_ref()
++            .and_then(|tracked| tracked.owned)
++    }
++
++    /// Forget ownership only after cleanup succeeded or was explicitly resolved.
++    pub fn complete(&self) {
++        self.0.lock().unwrap().take();
++    }
++
++    /// Windows OPEN may acknowledge only success, with wire id zero. Compare
++    /// inventories immediately, before accepting user input; ambiguity is an
++    /// error rather than permission to terminate someone else's session.
++    pub async fn identify(&self) -> Result<(), String> {
++        let (terminal, before) = {
++            let guard = self.0.lock().unwrap();
++            let Some(tracked) = guard.as_ref() else {
++                return Ok(());
++            };
++            if tracked.existing || tracked.owned.is_some() || tracked.wire.is_none() {
++                return Ok(());
++            }
++            (tracked.terminal.clone(), tracked.before.clone())
++        };
++        let after = ids(&terminal.list_sessions().await?);
++        let created: Vec<_> = after.difference(&before).copied().collect();
++        if created.len() > 1 {
++            return Err("Cannot identify the newly created terminal safely".into());
++        }
++        if let Some(tracked) = self.0.lock().unwrap().as_mut() {
++            tracked.owned = created.first().copied();
++            if created.is_empty() {
++                tracked.existing = true;
++            }
++        }
++        Ok(())
++    }
++
++    /// Explicitly attached sessions are detached. New sessions are removed with
++    /// KILL, while an already-exited shell needs no further action.
++    pub async fn finish(&self) -> Result<(), String> {
++        self.identify().await?;
++        let snapshot = self.0.lock().unwrap().as_ref().map(|tracked| {
++            (
++                tracked.terminal.clone(),
++                tracked.existing,
++                tracked.wire,
++                tracked.owned,
++            )
++        });
++        let Some((terminal, existing, wire, owned)) = snapshot else {
++            return Ok(());
++        };
++        if !existing && wire.is_none() {
++            return Err("Terminal open was interrupted before ownership was confirmed".into());
++        }
++        if existing {
++            if let Some(id) = wire {
++                terminal.detach(id).await?;
++            }
++        } else if let Some(id) = owned {
++            if ids(&terminal.list_sessions().await?).contains(&id) {
++                if let Err(error) = terminal.kill(id).await {
++                    if ids(&terminal.list_sessions().await?).contains(&id) {
++                        return Err(error);
++                    }
++                }
++            }
++        }
++        self.complete();
++        Ok(())
++    }
++}
+diff --git a/src/viewer/tools/mod.rs b/src/viewer/tools/mod.rs
+index 3fa50362e2245f13bb05859a441eb27b14fa6579..b9175049cb76dc31cbd823dfba17d2f847c9598f 100644
+--- a/src/viewer/tools/mod.rs
++++ b/src/viewer/tools/mod.rs
+@@ -1,5 +1,6 @@
+ //! Tool transports use only this peer's ordered channels; payloads are never logged.
+ pub mod terminal;
++pub mod lifecycle;
+ pub mod files;
+ pub mod portmap;
+ pub mod cli;
+diff --git a/src/viewer/tools/terminal.rs b/src/viewer/tools/terminal.rs
+index 6af986b358655efbf69a2945fba7c6f5374418ee..9ea9b3570eec4e47f672fd163ea215a5646ab194 100644
+--- a/src/viewer/tools/terminal.rs
++++ b/src/viewer/tools/terminal.rs
+@@ -5,6 +5,7 @@ use tokio::sync::oneshot;
+ use serde_json::{json,Value};
+ pub const OPEN:u8=1;pub const STDIN:u8=2;pub const RESIZE:u8=3;pub const CLOSE:u8=4;
+ pub const STDOUT:u8=5;pub const EXIT:u8=6;pub const ERROR:u8=8;
++pub const DETACH:u8=16;
+ pub const LIST_REQ:u8=9;pub const LIST_RESP:u8=10;pub const KILL_REQ:u8=11;pub const KILL_RESP:u8=12;pub const OPEN_RESP:u8=13;
+ pub struct Frame {pub kind:u8,pub session:u32,pub payload:Vec<u8>}
+ pub fn encode(kind:u8,session:u32,payload:&[u8])->Vec<u8>{
+@@ -56,7 +57,15 @@ impl Terminal {
+                         EXIT=>Some(Event::Exit{session:f.session,code:serde_json::from_slice::<Value>(&f.payload).ok().and_then(|v|v["exit_code"].as_i64()).unwrap_or(-1)}),
+                         ERROR=>Some(Event::Error{session:f.session}),_=>None,
+                     };
+-                    if let Some(event)=event {if tx.try_send(event).is_err(){overflow=true;break}}
++                    if let Some(event)=event {
++                        match tx.try_send(event) {
++                            Ok(())|Err(mpsc::error::TrySendError::Closed(_))=>{},
++                            Err(mpsc::error::TrySendError::Full(_))=>{overflow=true;break},
++                        }
++                        // The terminal reader is dropped before task cleanup.
++                        // Keep routing LIST/KILL replies even after its output
++                        // receiver closes; the owning Terminal still bounds this worker.
++                    }
+                     let key=if f.kind==OPEN_RESP {(OPEN_RESP,0)}else{(f.kind,f.session as u64)};
+                     let payload=if f.kind==OPEN_RESP {
+                         // Our host puts the new session in the frame header; the official Windows host answers with header 0,
+@@ -109,7 +118,7 @@ impl Terminal {
+     async fn open_session(&self,id:u32,cols:u16,rows:u16)->Result<u32,String>{
+         // Host TerminalConn handles OPEN(nonzero) as reattachment. The official Windows host rejects an OPEN
+         // without "option" ("terminal open: missing 'option' field", kError 1004); "none" is its plain mode.
+-        let b=self.request((OPEN_RESP,0),BINARY,encode(OPEN,id,json!({"cols":cols.max(1),"rows":rows.max(1),"option":"none"}).to_string().as_bytes())).await?;
++        let b=self.request((OPEN_RESP,0),BINARY,encode(OPEN,id,json!({"cols":cols.max(1),"rows":rows.max(1),"option":"none","session_id":id}).to_string().as_bytes())).await?;
+         let v:Value=serde_json::from_slice(&b).map_err(|_|"Invalid terminal open response")?;
+         if v["code"].as_i64()!=Some(0){return Err("Terminal open rejected".into())}
+         let id=v["session_id"].as_u64().or_else(||v["session_id"].as_str().and_then(|s|s.parse().ok())).and_then(|n|u32::try_from(n).ok()).filter(|n|*n!=0);
+@@ -121,9 +130,22 @@ impl Terminal {
+     pub async fn write(&self,id:u32,data:&[u8])->Result<(),String>{for b in data.chunks(16*1024){self.io.send(BINARY,encode(STDIN,id,b)).await?}Ok(())}
+     pub async fn resize(&self,id:u32,cols:u16,rows:u16)->Result<(),String>{self.io.send(BINARY,encode(RESIZE,id,json!({"cols":cols.max(1),"rows":rows.max(1)}).to_string().as_bytes())).await}
+     pub async fn close(&self,id:u32)->Result<(),String>{self.io.send(BINARY,encode(CLOSE,id,&[])).await}
++    pub async fn detach(&self,id:u32)->Result<(),String>{
++        self.io.send(BINARY,encode(DETACH,id,&[])).await
++    }
++
+     pub async fn kill(&self,id:u32)->Result<(),String>{
+-        let b=self.request((KILL_RESP,id as u64),BINARY,encode(KILL_REQ,id,&[])).await?;
+-        if serde_json::from_slice::<Value>(&b).ok().and_then(|v|v["code"].as_u64())!=Some(0){return Err("Terminal kill rejected".into())}Ok(())
++        // The official Mac coordinator JSON-encodes session_id in killSession;
++        // this project's host also accepts that payload form. Keep the header
++        // id for response correlation and older hosts.
++        let payload=json!({"session_id":id}).to_string();
++        let b=self.request((KILL_RESP,id as u64),BINARY,encode(KILL_REQ,id,payload.as_bytes())).await?;
++        let response:Value=serde_json::from_slice(&b).map_err(|_|"Invalid terminal kill response")?;
++        if response["code"].as_i64()!=Some(0) {
++            let message=response.get("message").and_then(Value::as_str).unwrap_or("").chars().filter(|c|!c.is_control()).take(100).collect::<String>();
++            return Err(format!("Terminal kill rejected: code={:?} message={message}",response.get("code").and_then(Value::as_i64)))
++        }
++        Ok(())
+     }
+ }
+ 
+diff --git a/src/viewer/tools/tests.rs b/src/viewer/tools/tests.rs
+index 3696fe4b8e459517c562060ac9dd4ffad097b3c3..4d8ce3ed480883b22d8411e64d36155d4372ef17 100644
+--- a/src/viewer/tools/tests.rs
++++ b/src/viewer/tools/tests.rs
+@@ -192,3 +192,198 @@ async fn terminal_kill_acknowledgement_and_empty_refresh(){
+     });
+     t.kill(42).await.unwrap();assert!(t.list_sessions().await.unwrap().is_empty());host.await.unwrap();
+ }
++
++/// Listing and terminating selected sessions must work without a TTY and never
++/// send OPEN; cleanup cannot itself allocate another remote PowerShell process.
++#[tokio::test]
++async fn terminal_management_never_opens_a_shell() {
++    for ids in [vec![],vec![37,41]] {
++        let (io,rx,input,mut out)=pair();
++        let expected=ids.clone();
++        let server=tokio::spawn(async move {
++            if expected.is_empty() {
++                let (channel,data)=out.recv().await.unwrap();
++                assert_eq!(channel,BINARY);
++                let frame=crate::terminal::decode(&data).unwrap();
++                assert_eq!(frame.kind,terminal::LIST_REQ);
++                input.send((BINARY,terminal::encode(terminal::LIST_RESP,frame.session,b"[]"))).await.unwrap();
++            } else {
++                let (channel,data)=out.recv().await.unwrap();
++                assert_eq!(channel,BINARY);
++                let list=crate::terminal::decode(&data).unwrap();
++                assert_eq!(list.kind,terminal::LIST_REQ);
++                let rows:Vec<_>=expected.iter().map(|id|serde_json::json!({"session_id":id})).collect();
++                input.send((BINARY,terminal::encode(terminal::LIST_RESP,list.session,serde_json::to_string(&rows).unwrap().as_bytes()))).await.unwrap();
++                for id in expected {
++                    let (channel,data)=out.recv().await.unwrap();
++                    assert_eq!(channel,BINARY);
++                    let frame=crate::terminal::decode(&data).unwrap();
++                    assert_eq!(frame.kind,terminal::KILL_REQ);
++                    assert_eq!(frame.session,id);
++                    input.send((BINARY,terminal::encode(terminal::KILL_RESP,id,br#"{"code":0}"#))).await.unwrap();
++                }
++            }
++            assert!(out.recv().await.is_none(),"management must not send OPEN or create another shell");
++        });
++        super::cli::terminal_manage(io,rx,&ids).await.unwrap();
++        server.await.unwrap();
++    }
++}
++
++/// Windows can acknowledge OPEN with id zero. Cleanup survives cancellation of
++/// the command future, identifies its one new id, and never kills the old id.
++#[tokio::test]
++async fn owned_terminal_cleanup_survives_command_cancellation() {
++    let (io,rx,input,mut out)=pair();
++    let (terminal,_events)=terminal::Terminal::new(io,rx);
++    let terminal=Arc::new(terminal);
++    let cleanup=lifecycle::Cleanup::default();
++    cleanup.track(terminal.clone(),false,&[serde_json::json!({"session_id":7})]);
++    let server=tokio::spawn(async move {
++        for _ in 0..2 {
++            let (_,data)=out.recv().await.unwrap();
++            let frame=crate::terminal::decode(&data).unwrap();
++            assert_eq!(frame.kind,terminal::LIST_REQ);
++            input.send((BINARY,terminal::encode(terminal::LIST_RESP,frame.session,br#"[{"session_id":7},{"session_id":9}]"#))).await.unwrap();
++        }
++        let (_,data)=out.recv().await.unwrap();
++        let frame=crate::terminal::decode(&data).unwrap();
++        assert_eq!(frame.kind,terminal::KILL_REQ);
++        assert_eq!(frame.session,9);
++        assert_eq!(serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap()["session_id"],9);
++        input.send((BINARY,terminal::encode(terminal::KILL_RESP,9,br#"{"code":0}"#))).await.unwrap();
++        assert!(out.recv().await.is_none());
++    });
++
++    let command_cleanup=cleanup.clone();
++    let command=async {
++        command_cleanup.opened(0);
++        command_cleanup.identify().await.unwrap();
++        std::future::pending::<()>().await;
++    };
++    assert!(tokio::time::timeout(Duration::from_millis(20),command).await.is_err());
++    assert_eq!(cleanup.owned(),Some(9));
++    cleanup.finish().await.unwrap();
++    assert_eq!(cleanup.owned(),None);
++    drop(terminal);
++    server.await.unwrap();
++}
++
++/// Explicit reattachment preserves user work: end only this viewer's attachment
++/// with DETACH, rather than CLOSE or KILL, which can terminate the remote shell.
++#[tokio::test]
++async fn attached_terminal_is_detached_and_never_deleted() {
++    let (io,rx,_input,mut out)=pair();
++    let (terminal,_events)=terminal::Terminal::new(io,rx);
++    let terminal=Arc::new(terminal);
++    let cleanup=lifecycle::Cleanup::default();
++    cleanup.track(terminal.clone(),true,&[]);
++    cleanup.opened(7);
++    cleanup.finish().await.unwrap();
++    drop(terminal);
++    let (_,data)=out.recv().await.unwrap();
++    let frame=crate::terminal::decode(&data).unwrap();
++    assert_eq!((frame.kind,frame.session),(terminal::DETACH,7));
++    assert!(out.recv().await.is_none());
++}
++
++/// Two sessions created concurrently cannot be attributed safely to this
++/// command. Keep both rather than guessing which one may contain user work.
++#[tokio::test]
++async fn ambiguous_new_terminals_are_not_deleted() {
++    let (io,rx,input,mut out)=pair();
++    let (terminal,_events)=terminal::Terminal::new(io,rx);
++    let terminal=Arc::new(terminal);
++    let cleanup=lifecycle::Cleanup::default();
++    cleanup.track(terminal.clone(),false,&[serde_json::json!({"session_id":7})]);
++    cleanup.opened(0);
++    let server=tokio::spawn(async move {
++        let (_,data)=out.recv().await.unwrap();
++        let frame=crate::terminal::decode(&data).unwrap();
++        assert_eq!(frame.kind,terminal::LIST_REQ);
++        input.send((BINARY,terminal::encode(terminal::LIST_RESP,frame.session,br#"[{"session_id":7},{"session_id":8},{"session_id":9}]"#))).await.unwrap();
++        assert!(out.recv().await.is_none(),"ambiguous ownership must not send KILL");
++    });
++    assert!(cleanup.finish().await.is_err());
++    assert_eq!(cleanup.owned(),None);
++    cleanup.complete();
++    drop(terminal);
++    server.await.unwrap();
++}
++
++/// A shell can exit before cleanup runs. An absent owned id is already clean
++/// and must not turn a successful remote command into a failed local command.
++#[tokio::test]
++async fn already_exited_owned_terminal_needs_no_kill() {
++    let (io,rx,input,mut out)=pair();
++    let (terminal,_events)=terminal::Terminal::new(io,rx);
++    let terminal=Arc::new(terminal);
++    let cleanup=lifecycle::Cleanup::default();
++    cleanup.track(terminal.clone(),false,&[]);
++    cleanup.opened(9);
++    let server=tokio::spawn(async move {
++        let (_,data)=out.recv().await.unwrap();
++        let frame=crate::terminal::decode(&data).unwrap();
++        assert_eq!(frame.kind,terminal::LIST_REQ);
++        input.send((BINARY,terminal::encode(terminal::LIST_RESP,frame.session,b"[]"))).await.unwrap();
++        assert!(out.recv().await.is_none());
++    });
++    cleanup.finish().await.unwrap();
++    drop(terminal);
++    server.await.unwrap();
++}
++
++/// A lost KILL acknowledgement may lead to a management retry after the shell
++/// was already removed. It must succeed without sending KILL to an absent id.
++#[tokio::test]
++async fn terminal_management_accepts_an_already_removed_session() {
++    let (io,rx,input,mut out)=pair();
++    let server=tokio::spawn(async move {
++        let (_,data)=out.recv().await.unwrap();
++        let frame=crate::terminal::decode(&data).unwrap();
++        assert_eq!(frame.kind,terminal::LIST_REQ);
++        input.send((BINARY,terminal::encode(terminal::LIST_RESP,frame.session,b"[]"))).await.unwrap();
++        assert!(out.recv().await.is_none());
++    });
++    super::cli::terminal_manage(io,rx,&[9]).await.unwrap();
++    server.await.unwrap();
++}
++
++/// Losing OPEN's acknowledgement cannot establish ownership. Report incomplete
++/// cleanup without targeting an arbitrary existing session from the inventory.
++#[tokio::test]
++async fn unconfirmed_open_never_guesses_a_session_to_delete() {
++    let (io,rx,_input,mut out)=pair();
++    let (terminal,_events)=terminal::Terminal::new(io,rx);
++    let terminal=Arc::new(terminal);
++    let cleanup=lifecycle::Cleanup::default();
++    cleanup.track(terminal.clone(),false,&[serde_json::json!({"session_id":7})]);
++    assert!(cleanup.finish().await.is_err());
++    assert_eq!(cleanup.owned(),None);
++    cleanup.complete();
++    drop(terminal);
++    assert!(out.recv().await.is_none());
++}
++
++/// Dropping the command's output reader must not kill the RPC worker before
++/// cleanup can list or remove its session, even when final stdout is in flight.
++#[tokio::test]
++async fn cleanup_rpc_survives_a_closed_terminal_output_reader() {
++    let (io,rx,input,mut out)=pair();
++    let (terminal,events)=terminal::Terminal::new(io,rx);
++    drop(events);
++    let server=tokio::spawn(async move {
++        let (_,data)=out.recv().await.unwrap();
++        let request=crate::terminal::decode(&data).unwrap();
++        assert_eq!(request.kind,terminal::LIST_REQ);
++        input.send((BINARY,terminal::encode(terminal::STDOUT,9,b"synthetic-final-output"))).await.unwrap();
++        input.send((BINARY,terminal::encode(terminal::LIST_RESP,request.session,b"[]"))).await.unwrap();
++        let (_,data)=out.recv().await.unwrap();
++        let request=crate::terminal::decode(&data).unwrap();
++        assert_eq!((request.kind,request.session),(terminal::KILL_REQ,9));
++        input.send((BINARY,terminal::encode(terminal::KILL_RESP,9,br#"{"code":0}"#))).await.unwrap();
++    });
++    assert!(terminal.list_sessions().await.unwrap().is_empty());
++    terminal.kill(9).await.unwrap();
++    server.await.unwrap();
++}
 diff --git a/src/viewer_main.rs b/src/viewer_main.rs
-index 06c3c35dca506161c6f18baf6dd773ba9d5621f6..7a61369cbfae23761d16807a2c776389ef9c719f 100644
+index 06c3c35dca506161c6f18baf6dd773ba9d5621f6..b92ab7e878f40f8f3b6cc8372bc9a64b335a0841 100644
 --- a/src/viewer_main.rs
 +++ b/src/viewer_main.rs
-@@ -27,7 +27,16 @@ async fn main() {
+@@ -15,7 +15,7 @@ use viewer::clipboard;
+ #[cfg(test)] #[path="initialization.rs"] mod initialization;
+ use viewer::{api::Api,rtc::ReadyPolicy,session::{Options,Session},wire::Shape};
+ use std::time::Duration;
+-const HELP:&str="Experimental native viewer.\n  uuremote-viewer ui   (GTK window: sign-in, devices, sessions) Desktop UI requires viewer-sdl (decodes with the ffmpeg CLI, or FFmpeg 6.x libraries with viewer-ffmpeg).\n  uuremote-viewer power DEVICE reboot|shutdown\n  uuremote-viewer type DEVICE [options]   (secret from UU_INPUT_ENV or stdin; reuses running viewer)\n    options: --delay-ms MS --omit-last N --snapshot PATH --dry-run --new-session\n  uuremote-viewer unbind DEVICE [--shared]   (从账号删除设备 / remove a device from the account)\n  uuremote-viewer terminal DEVICE [SESSION]\n  uuremote-viewer files DEVICE ls PATH | get REMOTE LOCAL | put LOCAL REMOTE\n  uuremote-viewer portmap DEVICE LOCAL_PORT HOST PORT\n  uuremote-viewer files-ui|portmap-ui|terminal-ui DEVICE NAME   (GTK tool windows)\n  uuremote-viewer login [--no-gui]\n  uuremote-viewer devices METHOD ARRAY_POINTER ID_POINTER NAME_POINTER\n  uuremote-viewer assist CONNECT_ID   (验证码从 stdin 读取一行)\n  uuremote-viewer connect DEVICE true|false SHAPE_JSON echo|manual raw|legacy [--view-only]\nVideo: UU_VIEWER_CODEC=h264 forces H.264; UU_VIEWER_CHROMA=444 requests true color (default 4:2:0).\nAudio: UU_VIEWER_AUDIO=0 disables playback. UU_VIEWER_VIEW_ONLY=1 disables desktop input.\nDevice-list method/JSON pointers and compatibility shape require verified operator configuration.\nQR login reuses the sibling uuremote-server login command. Never run login in a captured log.\nEcho readiness is transport observation only; desktop sessions send one sendVideoTrack RPC (like the official iPhone viewer).";
++const HELP:&str="Experimental native viewer.\n  uuremote-viewer ui   (GTK window: sign-in, devices, sessions) Desktop UI requires viewer-sdl (decodes with the ffmpeg CLI, or FFmpeg 6.x libraries with viewer-ffmpeg).\n  uuremote-viewer power DEVICE reboot|shutdown\n  uuremote-viewer type DEVICE [options]   (secret from UU_INPUT_ENV or stdin; reuses running viewer)\n    options: --delay-ms MS --omit-last N --snapshot PATH --dry-run --new-session\n  uuremote-viewer unbind DEVICE [--shared]   (从账号删除设备 / remove a device from the account)\n  uuremote-viewer terminal DEVICE [SESSION]\n  uuremote-viewer terminal-list DEVICE\n  uuremote-viewer terminal-kill DEVICE SESSION...\n  uuremote-viewer files DEVICE ls PATH | get REMOTE LOCAL | put LOCAL REMOTE\n  uuremote-viewer portmap DEVICE LOCAL_PORT HOST PORT\n  uuremote-viewer files-ui|portmap-ui|terminal-ui DEVICE NAME   (GTK tool windows)\n  uuremote-viewer login [--no-gui]\n  uuremote-viewer devices METHOD ARRAY_POINTER ID_POINTER NAME_POINTER\n  uuremote-viewer assist CONNECT_ID   (验证码从 stdin 读取一行)\n  uuremote-viewer connect DEVICE true|false SHAPE_JSON echo|manual raw|legacy [--view-only]\nVideo: UU_VIEWER_CODEC=h264 forces H.264; UU_VIEWER_CHROMA=444 requests true color (default 4:2:0).\nAudio: UU_VIEWER_AUDIO=0 disables playback. UU_VIEWER_VIEW_ONLY=1 disables desktop input.\nDevice-list method/JSON pointers and compatibility shape require verified operator configuration.\nQR login reuses the sibling uuremote-server login command. Never run login in a captured log.\nEcho readiness is transport observation only; desktop sessions send one sendVideoTrack RPC (like the official iPhone viewer).";
+ const DEFAULT_SHAPE:&str=r#"{"capture_type":1,"platform":3,"client_version":"4.42.0","width":1920,"height":1080,"fps":60,"chroma":1,
+  "decoders":[{"fps":60,"codec":1,"width":3840,"height":2160,"chroma":1}],"display_modes":[[1920,1080,60]],
+  "displays":[{"id":1,"fps":60,"type":0,"hdr":0}],
+@@ -26,8 +26,17 @@ async fn main() {
+     // Do not inherit broad RUST_LOG filters that could expose third-party wire diagnostics.
      let args:Vec<String>=std::env::args().skip(1).collect();
      // The terminal tool owns the TTY: diagnostics would interleave with the remote shell's screen.
-     let level=if args.first().is_some_and(|m|matches!(m.as_str(),"terminal"|"terminal-local")){log::LevelFilter::Off}else{log::LevelFilter::Info};
+-    let level=if args.first().is_some_and(|m|matches!(m.as_str(),"terminal"|"terminal-local")){log::LevelFilter::Off}else{log::LevelFilter::Info};
 -    env_logger::Builder::new().filter_level(log::LevelFilter::Off).filter_module("uuremote_viewer",level).init();
++    let level=if args.first().is_some_and(|m|matches!(m.as_str(),"terminal"|"terminal-local"|"terminal-list"|"terminal-kill")){log::LevelFilter::Off}else{log::LevelFilter::Info};
 +    let mut logger=env_logger::Builder::new();
 +    logger.filter_level(log::LevelFilter::Off).filter_module("uuremote_viewer",level);
 +    // Opt-in terminal diagnostics use an explicit module allowlist. Never enable
@@ -373,17 +1149,95 @@ index 06c3c35dca506161c6f18baf6dd773ba9d5621f6..7a61369cbfae23761d16807a2c776389
      match run(&args).await {Ok(())=>{},Err(error)=>{eprintln!("{error}");std::process::exit(2)}}
  }
  async fn run(args:&[String])->Result<(),String> {
-@@ -284,7 +293,12 @@ async fn tool_command(args:&[String])->Result<(),String>{
+@@ -67,7 +76,7 @@ async fn run(args:&[String])->Result<(),String> {
+             let session=if args.len()==3{Some(args[2].parse::<u32>().ok().filter(|n|*n!=0).ok_or("Invalid terminal session id")?)}else{None};
+             viewer::tools::terminal_ipc::client(std::path::Path::new(&args[1]),session).await
+         },
+-        Some("terminal"|"files"|"portmap"|"files-ui"|"portmap-ui"|"terminal-ui")=>tool_command(args).await,
++        Some("terminal"|"terminal-list"|"terminal-kill"|"files"|"portmap"|"files-ui"|"portmap-ui"|"terminal-ui")=>tool_command(args).await,
+         Some("assist") if args.len()==2=> {
+             let code=viewer::assist::read_code(std::io::stdin().lock())?;
+             desktop_command(&["connect".into(),args[1].clone(),"false".into(),"-".into(),"echo".into(),"legacy".into()],Some(code)).await.map_err(|e|crate::tr!("协助连接失败：{e}","Assistance connection failed: {e}"))
+@@ -218,7 +227,7 @@ mod cli_tests {
+     use super::*;
+     #[tokio::test]
+     async fn invalid_commands_never_fall_through_to_login_or_host_service() {
+-        for args in [vec!["invalid"],vec!["power"],vec!["power","device","logout"],vec!["power","device","reboot","extra"],vec!["type"],vec!["type","device","--delay-ms"],vec!["type","device","--delay-ms","x"],vec!["type","device","extra"],vec!["type","device","--omit-last"],vec!["type","device","--snapshot"],vec!["login","--invalid"],vec!["connect"],vec!["assist"],vec!["assist","id","forbidden-code-argument"],vec!["terminal"],vec!["terminal","device","extra"],vec!["terminal","device","0"],vec!["terminal","device","4294967296"],vec!["terminal-ui","device"],vec!["files","device","bad","path"],vec!["portmap","device","bad","host","80"],vec!["portmap","device","8000","host","0"],vec!["devices","DELETE","/data","/id","/name"],vec!["unbind"],vec!["unbind",""],vec!["unbind","device","--other"],vec!["unbind","device","--shared","extra"]] {
++        for args in [vec!["invalid"],vec!["power"],vec!["power","device","logout"],vec!["power","device","reboot","extra"],vec!["type"],vec!["type","device","--delay-ms"],vec!["type","device","--delay-ms","x"],vec!["type","device","extra"],vec!["type","device","--omit-last"],vec!["type","device","--snapshot"],vec!["login","--invalid"],vec!["connect"],vec!["assist"],vec!["assist","id","forbidden-code-argument"],vec!["terminal"],vec!["terminal","device","extra"],vec!["terminal","device","0"],vec!["terminal","device","4294967296"],vec!["terminal-ui","device"],vec!["terminal-list"],vec!["terminal-kill","device"],vec!["terminal-kill","device","0"],vec!["terminal-kill","device","4294967296"],vec!["files","device","bad","path"],vec!["portmap","device","bad","host","80"],vec!["portmap","device","8000","host","0"],vec!["devices","DELETE","/data","/id","/name"],vec!["unbind"],vec!["unbind",""],vec!["unbind","device","--other"],vec!["unbind","device","--shared","extra"]] {
+             assert!(run(&args.into_iter().map(str::to_owned).collect::<Vec<_>>()).await.is_err());
+         }
+     }
+@@ -257,8 +266,12 @@ mod cli_tests {
+ }
+ 
+ async fn tool_command(args:&[String])->Result<(),String>{
+-    let capture=match args[0].as_str(){"terminal" if args.len()==2 || args.len()==3=>8,"terminal-ui" if args.len()==3=>8,"files" if (args.len()==4 && args[2]=="ls") || (args.len()==5 && ["get","put"].contains(&args[2].as_str()))=>5,"portmap" if args.len()==5=>9,"files-ui" if args.len()==3=>5,"portmap-ui" if args.len()==3=>9,_=>return Err(HELP.into())};
++    let capture=match args[0].as_str(){"terminal" if args.len()==2 || args.len()==3=>8,"terminal-list" if args.len()==2=>8,"terminal-kill" if args.len()>=3=>8,"terminal-ui" if args.len()==3=>8,"files" if (args.len()==4 && args[2]=="ls") || (args.len()==5 && ["get","put"].contains(&args[2].as_str()))=>5,"portmap" if args.len()==5=>9,"files-ui" if args.len()==3=>5,"portmap-ui" if args.len()==3=>9,_=>return Err(HELP.into())};
+     let terminal_session=if args[0]=="terminal" && args.len()==3{Some(args[2].parse::<u32>().ok().filter(|n|*n!=0).ok_or("Invalid terminal session id")?)}else{None};
++    let terminal_kill=if args[0]=="terminal-kill" {
++        args[2..].iter().map(|value|value.parse::<u32>().ok().filter(|id|*id!=0).ok_or("Invalid terminal session id"))
++            .collect::<Result<Vec<_>,_>>()?
++    } else {Vec::new()};
+     #[cfg(not(uu_gtk))] if args[0].ends_with("-ui"){return Err("Tool windows require the GTK build".into())}
+     let ports=if args[0]=="portmap"{Some((args[2].parse::<u16>().map_err(|_|"Invalid local port")?,args[4].parse::<u16>().map_err(|_|"Invalid target port")?))}else{None};
+     if ports.is_some_and(|(_,port)|port==0) || (args[0]=="portmap" && args[3].trim().is_empty()){return Err("Invalid forwarding target".into())}
+@@ -270,13 +283,16 @@ async fn tool_command(args:&[String])->Result<(),String>{
+     // Match the existing UI connection framing (9bb42d5); the host tolerates this prefix.
+     let options=Options{timeout:Duration::from_secs(12),legacy_prefix:true,ready_policy:ReadyPolicy::EchoOnly,clipboard:clipboard::Bridge::new(false)};
+     let mut session=Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()).await?;
++    let cleanup=viewer::tools::lifecycle::Cleanup::default();
+     let result=async{
+         let(io,rx)=viewer::tools::attach(&session.peer)?;
+         let ready=async{
+             loop{if session.peer.channels.iter().enumerate().filter(|(i,_)|[0,if capture==8{4}else{3}].contains(i)).all(|(_,c)|c.ready_state()==webrtc::data_channel::data_channel_state::RTCDataChannelState::Open) && session.peer.observed.echo_received.load(std::sync::atomic::Ordering::Acquire){break}tokio::select!{r=session.step()=>r?,_=tokio::time::sleep(Duration::from_millis(20))=>{}}}Ok::<_,String>(())
+         };
+         tokio::time::timeout(Duration::from_secs(30),ready).await.map_err(|_|"Tool connection timed out")??;
+-        let operation=async{match args[0].as_str(){"terminal"=>viewer::tools::cli::terminal(io,rx,terminal_session).await,"files"=>viewer::tools::cli::files(io,rx,&args[2..]).await,
++        let operation=async{match args[0].as_str(){"terminal"=>viewer::tools::cli::terminal(io,rx,terminal_session,cleanup.clone()).await,
++            "terminal-list"=>viewer::tools::cli::terminal_manage(io,rx,&[]).await,
++            "terminal-kill"=>viewer::tools::cli::terminal_manage(io,rx,&terminal_kill).await,"files"=>viewer::tools::cli::files(io,rx,&args[2..]).await,
+             #[cfg(uu_gtk)] "terminal-ui"=>viewer::tools_ui::terminal(io,rx,&args[1],&args[2]).await,
+             #[cfg(uu_gtk)] "files-ui"=>viewer::tools_ui::files(io,rx,&args[2]).await,
+             #[cfg(uu_gtk)] "portmap-ui"=>viewer::tools_ui::portmap(io,rx,&args[2]).await,
+@@ -284,9 +300,39 @@ async fn tool_command(args:&[String])->Result<(),String>{
              _=>Err("Tool windows require the GTK build".into())}};
          tokio::pin!(operation);
          let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;
 -        loop{tokio::select!{r=&mut operation=>break r,r=session.step()=>r?,_=terminate.recv()=>break Ok(()),_=tokio::signal::ctrl_c()=>break Ok(())}}
++        let mut hangup=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).map_err(|_|"Cannot watch terminal hangup")?;
 +        // Official Windows hosts require CONTROL heartbeats for tool peers too.
 +        // Match the existing desktop loop so idle text terminals stay connected.
 +        let mut heartbeat=tokio::time::interval(Duration::from_secs(1));
 +        loop{tokio::select!{r=&mut operation=>break r,r=session.step()=>r?,
 +            _=heartbeat.tick()=>if session.peer.observed.control_open.load(std::sync::atomic::Ordering::Acquire){session.peer.send_input(&viewer::input::Input::heartbeat()).await?;},
-+            _=terminate.recv()=>break Ok(()),_=tokio::signal::ctrl_c()=>break Ok(())}}
++            _=terminate.recv()=>break Ok(()),_=hangup.recv()=>break Ok(()),_=tokio::signal::ctrl_c()=>break Ok(())}}
      }.await;
-     session.close().await;result
+-    session.close().await;result
++    // The terminal future has now been dropped and restored its TTY. Cleanup
++    // still owns the protocol worker, so even an outer signaling error cannot
++    // skip KILL for the remote shell created by this invocation.
++    let cleaned=tokio::time::timeout(Duration::from_secs(5),cleanup.finish()).await;
++    session.close().await;
++    let mut cleanup_error=None;
++    if !matches!(cleaned,Ok(Ok(()))) {
++        if let Some(id)=cleanup.owned() {
++            // If signaling also closed the old data channels, reconnect only
++            // the management path. It never sends OPEN or creates a shell.
++            let reap=vec!["terminal-kill".into(),args[1].clone(),id.to_string()];
++            if matches!(tokio::time::timeout(Duration::from_secs(20),Box::pin(tool_command(&reap))).await,Ok(Ok(()))) {
++                cleanup.complete();
++            } else {
++                cleanup_error=Some(format!("Remote terminal cleanup pending: session_id={id}"));
++            }
++        } else {
++            cleanup_error=Some("Remote terminal cleanup could not confirm ownership; no existing session was terminated.".to_owned());
++        }
++    }
++    match (result,cleanup_error) {
++        (Ok(()),Some(error))=>Err(error),
++        (Err(error),Some(cleanup))=>Err(format!("{error}; {cleanup}")),
++        (result,None)=>result,
++    }
  }
+ 
+ async fn power_command(args:&[String])->Result<(),String>{

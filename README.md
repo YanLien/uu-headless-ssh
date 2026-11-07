@@ -68,6 +68,28 @@ Codex 使用带 PTY 的命令工具启动交互模式，然后通过该工具的
 `Ctrl+]` 断开本地入口。远端程序可能继续运行；结束远端工作时应先正常退出程序。
 Linux 的 zsh 可能把整段输入当作粘贴；命令停留在输入行时，再单独发送一次回车。
 
+直接在 Ghostty 等本地终端进入 Windows PowerShell：
+
+```sh
+cd ~/uu-headless
+uu_device_id=$(python3 -c 'import json; print(json.load(open("config.json"))["uu_device_id"])')
+swift scripts/credentials.swift "$PWD/bin/uuremote-viewer" terminal "$uu_device_id"
+```
+
+此入口停留在 Windows。输入 `exit` 正常结束远端 PowerShell。
+
+如连接意外结束，可在上面的 `swift` 命令前加 `UU_TERMINAL_DIAGNOSTICS=1`：
+
+```sh
+UU_TERMINAL_DIAGNOSTICS=1 swift scripts/credentials.swift \
+  "$PWD/bin/uuremote-viewer" terminal "$uu_device_id"
+```
+
+诊断只启用信令模块的事件名、结构和状态，不记录终端输入、输出或凭据。
+不要用 `2>&1 | tee ...` 保存交互式终端，以免将远端内容一并写入日志。
+请保留连接结束时的错误文字；`Remote session released` 表示收到匹配的释放通知，
+`Signaling room closed` / `Signaling disconnected` 表示信令房间或传输结束。
+
 ## 实现
 
 1. Swift 启动器在本机内存中恢复当前用户已有的 UU 登录上下文，使用登录令牌中的客户端与设备标识。
@@ -90,7 +112,7 @@ Linux 的 zsh 可能把整段输入当作粘贴；命令停留在输入行时，
 | `config.example.json` | 可提交的配置模板 |
 
 协议客户端来自 [VallierDev/uu-remote-linux](https://github.com/VallierDev/uu-remote-linux)，按固定提交构建。
-补丁处理 macOS 登录中允许为空的 `system_id`、`/dev/tty` 输入的 kqueue 兼容性，以及工具连接的 CONTROL 保活。
+补丁处理 macOS 登录中允许为空的 `system_id`、`/dev/tty` 输入的 kqueue 兼容性，工具连接的 CONTROL 保活，以及分段信令在轮询被取消后仍能继续读取。
 Swift 启动器通过 `execv` 保持前台终端进程组，避免交互客户端被系统挂起。
 
 `config.json`、编译产物、构建目录和日志均由 `.gitignore` 排除。
@@ -105,13 +127,14 @@ python3 scripts/build.py --release
 ## 验证与限制
 
 已在 macOS + UU 4.46.0 → Windows / OpenSSH 9.5 → Ubuntu 24.04 的真实链路验证 SSH 和交互式终端。
-适配时运行了上游 7 项认证测试与 12 项终端/转发测试。
+适配时运行了上游认证与终端/转发测试；新增回归模拟分段信令读取被反复取消，并验证分段期间的心跳响应。
 
 上游回归测试命令（在 `.build/upstream` 中运行）：
 
 ```sh
 cargo test --locked --features native-viewer --bin uuremote-viewer auth::
 cargo test --locked --features native-viewer --bin uuremote-viewer viewer::tools::tests::
+cargo test --locked --features native-viewer --bin uuremote-viewer viewer::tests:: -- --test-threads=1
 ```
 
 这是第三方协议兼容实现，与网易无关联。当前凭据读取针对已验证的 macOS UU 版本；UU 更新后需要重新验证。

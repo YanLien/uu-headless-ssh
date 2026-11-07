@@ -1,5 +1,5 @@
 diff --git a/src/auth.rs b/src/auth.rs
-index 13302ad..431d541 100644
+index 13302ad2099aa7c3f734997e0b9c95d387f51e45..431d5413ba9052ffc448ffcdd0e9b28982a5625d 100644
 --- a/src/auth.rs
 +++ b/src/auth.rs
 @@ -59,8 +59,10 @@ impl Credentials {
@@ -14,8 +14,300 @@ index 13302ad..431d541 100644
              .iter().filter(|(_, v)| v.is_empty()).map(|(k, _)| *k).collect();
          if missing.is_empty() { Ok(creds) } else { Err(format!("missing credential settings: {}", missing.join(", "))) }
      }
+diff --git a/src/viewer/session.rs b/src/viewer/session.rs
+index e850812138da1cb686b488a7c43bdc9ff84fb4c6..afa956c44c5492814f5c39680b6306281c3793af 100644
+--- a/src/viewer/session.rs
++++ b/src/viewer/session.rs
+@@ -60,7 +60,12 @@ impl Session {
+                     Some("soac")=>if let Some(body)=event.get(1) {self.peer.receive(body).await?},
+                     Some("released"|"left"|"leave")=> {
+                         // An event for another peer must not tear down this session.
+-                        if self.peer.matches_route(event.get(1).unwrap_or(&Value::Null)) {return Err("Remote session released".into())}
++                        let route=event.get(1).unwrap_or(&Value::Null);
++                        let body=route.get("data").unwrap_or(route);
++                        let matches=self.peer.matches_route(route);
++                        log::info!("Viewer release: matched={} ice_id_present={} app_control_id_present={} client_id_present={}",
++                            matches,body.get("ice_id").is_some(),body.get("app_control_id").is_some(),route.get("client_id").is_some());
++                        if matches {return Err("Remote session released".into())}
+                     }
+                     _=>{},
+                 }
+diff --git a/src/viewer/signal.rs b/src/viewer/signal.rs
+index b87d872b959209dac4e126a1892312e8a9cd267a..d55cd5fef9144c9afcaa650f0b6482d43406dbdd 100644
+--- a/src/viewer/signal.rs
++++ b/src/viewer/signal.rs
+@@ -8,10 +8,18 @@ use std::{collections::VecDeque,time::Duration};
+ 
+ pub struct Signal {
+     ws: crate::ws_transport::Socket,
++
+     next_ack:u64,
++
+     pending:VecDeque<Value>,
++
+     legacy_prefix:bool,
++
++    /// A binary header may arrive before a heartbeat cancels event polling.
++    /// Retain it and any completed attachments until the whole packet arrives.
++    binary:Option<BinaryPacket>,
+ }
++
+ impl Signal {
+     pub async fn connect(urls:&[String], token:&str, timeout:Duration, legacy_prefix:bool)->Result<Self,String> {
+         for url in urls {
+@@ -19,11 +27,12 @@ impl Signal {
+         }
+         Err("Signaling connection failed (details omitted)".into())
+     }
++
+     async fn one(url:&str,token:&str,legacy_prefix:bool,timeout:Duration)->Result<Self,String> {
+         let mut request=format!("{}/socket.io/?transport=websocket&EIO=4",url.trim_end_matches('/')).into_client_request().map_err(|_|"Invalid signaling endpoint")?;
+         request.headers_mut().insert("X-NRD-AUTH",token.parse().map_err(|_|"Invalid room authentication header")?);
+         let ws=crate::ws_transport::connect(request,timeout).await?;
+-        let mut s=Self{ws,next_ack:10,pending:VecDeque::new(),legacy_prefix};
++        let mut s=Self{ws,next_ack:10,pending:VecDeque::new(),legacy_prefix,binary:None};
+         let mut opened=false;
+         loop {
+             match s.ws.next().await {
+@@ -38,7 +47,9 @@ impl Signal {
+             }
+         }
+     }
++
+     async fn send(&mut self,message:Message)->Result<(),String> {self.ws.send(message).await.map_err(|_|"Signaling send failed".into())}
++
+     pub async fn control(&mut self, header:Value, app_data:Vec<u8>, timeout:Duration)->Result<Value,String> {
+         self.next_ack+=1;let id=self.next_ack;
+         self.send(Message::Text(format!("451-{id}{}",serde_json::json!(["control",header])))).await?;
+@@ -61,6 +72,7 @@ impl Signal {
+             }
+         }).await.map_err(|_|"Control acknowledgement timed out")?
+     }
++
+     async fn packet(&mut self)->Result<Packet,String> {
+         loop {
+             match self.ws.next().await {
+@@ -77,45 +89,23 @@ impl Signal {
+                     let value=serde_json::from_str(&t[begin..]).map_err(|_|"Malformed signaling event body")?;
+                     return Ok(Packet::Event(value))
+                 }
+-                // Socket.IO binary event (45N-[...] / 46N-[...] ack) followed by N attachment frames.
+-                // The official host sends its answer this way (binary gzip_sdp); attachments are
+-                // substituted as base64 strings so the existing gzip_sdp decoder applies.
++                // The tool loop polls signaling alongside its one-second heartbeat.
++                // Keep partial binary packets in Self so cancellation cannot discard
++                // an SDP header while its separate WebSocket attachments are in flight.
+                 Some(Ok(Message::Text(t))) if t.starts_with("45") || t.starts_with("46")=> {
+-                    let dash=t.find('-').ok_or("Malformed binary signaling packet")?;
+-                    let count:usize=t[2..dash].parse().map_err(|_|"Malformed binary attachment count")?;
+-                    if count>8 {return Err("Too many signaling attachments".into())}
+-                    let begin=t.find('[').ok_or("Malformed binary signaling packet")?;
+-                    let mut value:serde_json::Value=serde_json::from_str(&t[begin..]).map_err(|_|"Malformed binary signaling body")?;
+-                    let mut attachments=Vec::with_capacity(count);
+-                    while attachments.len()<count {
+-                        match self.ws.next().await {
+-                            Some(Ok(Message::Binary(mut b)))=>{
+-                                if b.len()>2 && b[0]==4 && b[1]==0x1f {b.remove(0);}
+-                                if b.len()>4*1024*1024 {return Err("Signaling attachment too large".into())}
+-                                attachments.push(base64::engine::general_purpose::STANDARD.encode(&b));
+-                            }
+-                            Some(Ok(Message::Text(t))) if t.starts_with('2')=>self.send(Message::Text(format!("3{}",&t[1..]))).await?,
+-                            Some(Ok(_))=>{},
+-                            _=>return Err("Signaling disconnected".into()),
+-                        }
+-                    }
+-                    fn fill(v:&mut serde_json::Value,a:&[String]) {
+-                        match v {
+-                            serde_json::Value::Object(o) if o.get("_placeholder")==Some(&serde_json::Value::Bool(true))=>{
+-                                if let Some(s)=o.get("num").and_then(|n|n.as_u64()).and_then(|n|a.get(n as usize)) {*v=serde_json::Value::String(s.clone());}
+-                            }
+-                            serde_json::Value::Object(o)=>for x in o.values_mut(){fill(x,a)},
+-                            serde_json::Value::Array(l)=>for x in l{fill(x,a)},
+-                            _=>{},
+-                        }
+-                    }
+-                    fill(&mut value,&attachments);
+-                    log::info!("Viewer binary signaling event: name={} attachments={}",value.get(0).and_then(|v|v.as_str()).unwrap_or("-"),count);
+-                    if t.starts_with("46") {
+-                        let id=t[dash+1..begin].parse().map_err(|_|"Malformed binary acknowledgement id")?;
+-                        return Ok(Packet::Ack(id,value))
++                    if self.binary.is_some(){return Err("Overlapping binary signaling packets".into())}
++                    let packet=BinaryPacket::header(&t)?;
++                    if packet.count==0 {return Ok(packet.finish())}
++                    self.binary=Some(packet);
++                }
++                Some(Ok(Message::Binary(mut b))) if self.binary.is_some()=> {
++                    if b.len()>2 && b[0]==4 && b[1]==0x1f {b.remove(0);}
++                    if b.len()>4*1024*1024 {return Err("Signaling attachment too large".into())}
++                    let packet=self.binary.as_mut().unwrap();
++                    packet.attachments.push(base64::engine::general_purpose::STANDARD.encode(&b));
++                    if packet.attachments.len()==packet.count {
++                        return Ok(self.binary.take().unwrap().finish())
+                     }
+-                    return Ok(Packet::Event(value))
+                 }
+                 Some(Ok(Message::Text(t))) if t=="41" || t=="1"=>return Err("Signaling room closed".into()),
+                 Some(Ok(Message::Close(_)))|None|Some(Err(_))=>return Err("Signaling disconnected".into()),
+@@ -126,11 +116,59 @@ impl Signal {
+             }
+         }
+     }
++
+     pub async fn event(&mut self)->Result<Value,String> {
+         if let Some(v)=self.pending.pop_front(){return Ok(v)}
+         loop {if let Packet::Event(v)=self.packet().await?{return Ok(v)}}
+     }
++
+     pub async fn soac(&mut self, value:Value)->Result<(),String> {self.send(Message::Text(format!("42{}",serde_json::json!(["soac",value])))).await}
++
+     pub async fn close(&mut self) {let _=self.ws.close(None).await;}
+ }
++
+ enum Packet { Ack(u64,Value), Event(Value) }
++
++/// A Socket.IO binary packet spans a JSON header and subsequent binary frames.
++/// Its contents stay private; diagnostics expose only the attachment count.
++struct BinaryPacket {
++    value:Value,
++
++    count:usize,
++
++    attachments:Vec<String>,
++
++    ack:Option<u64>,
++}
++
++impl BinaryPacket {
++    fn header(text:&str)->Result<Self,String> {
++        let dash=text.find('-').ok_or("Malformed binary signaling packet")?;
++        let count:usize=text[2..dash].parse().map_err(|_|"Malformed binary attachment count")?;
++        if count>8 {return Err("Too many signaling attachments".into())}
++        let begin=text.find('[').filter(|begin|*begin>dash).ok_or("Malformed binary signaling packet")?;
++        let value=serde_json::from_str(&text[begin..]).map_err(|_|"Malformed binary signaling body")?;
++        let ack=if text.starts_with("46") {
++            Some(text[dash+1..begin].parse().map_err(|_|"Malformed binary acknowledgement id")?)
++        } else {None};
++        Ok(Self{value,count,attachments:Vec::with_capacity(count),ack})
++    }
++
++    fn finish(mut self)->Packet {
++        fn fill(value:&mut Value,attachments:&[String]) {
++            match value {
++                Value::Object(object) if object.get("_placeholder")==Some(&Value::Bool(true))=> {
++                    if let Some(data)=object.get("num").and_then(Value::as_u64).and_then(|n|attachments.get(n as usize)) {
++                        *value=Value::String(data.clone());
++                    }
++                }
++                Value::Object(object)=>for value in object.values_mut(){fill(value,attachments)},
++                Value::Array(array)=>for value in array{fill(value,attachments)},
++                _=>{},
++            }
++        }
++        fill(&mut self.value,&self.attachments);
++        log::info!("Viewer binary signaling packet: attachments={} acknowledgement={}",self.count,self.ack.is_some());
++        match self.ack {Some(id)=>Packet::Ack(id,self.value),None=>Packet::Event(self.value)}
++    }
++}
+diff --git a/src/viewer/tests.rs b/src/viewer/tests.rs
+index 5cc95bb0116d52c45997e1ee050ae71dc18630a1..8b35928c612c5a5fbd17d4f049eb1f9311626a18 100644
+--- a/src/viewer/tests.rs
++++ b/src/viewer/tests.rs
+@@ -60,6 +60,93 @@ async fn websocket_control_ack_framing_heartbeat_failure_and_timeout() {
+     assert!(signal.control(json!({}),vec![],Duration::from_millis(20)).await.unwrap_err().contains("timed out"));signal.close().await;job.await.unwrap();
+ }
+ 
++/// The cloud may acknowledge control with a binary packet, including the
++/// zero-attachment form. Both forms must preserve the acknowledgement id.
++#[tokio::test]
++async fn websocket_binary_control_acknowledgements() {
++    for attached in [false,true] {
++        let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();
++        let url=format!("ws://{}",listener.local_addr().unwrap());
++        let server=tokio::spawn(async move {
++            let (stream,_)=listener.accept().await.unwrap();
++            let mut ws=accept_async(stream).await.unwrap();
++            ws.send(Message::Text("0{}".into())).await.unwrap();
++            assert_eq!(ws.next().await.unwrap().unwrap(),Message::Text("40".into()));
++            ws.send(Message::Text("40{}".into())).await.unwrap();
++            assert!(matches!(ws.next().await.unwrap().unwrap(),Message::Text(_)));
++            assert!(matches!(ws.next().await.unwrap().unwrap(),Message::Binary(_)));
++
++            if attached {
++                let ack=json!(["success",{"payload":{"_placeholder":true,"num":0}}]);
++                ws.send(Message::Text(format!("461-11{ack}"))).await.unwrap();
++                ws.send(Message::Binary(vec![8,1])).await.unwrap();
++            } else {
++                ws.send(Message::Text("460-11[\"success\",{}]".into())).await.unwrap();
++            }
++            while ws.next().await.is_some() {}
++        });
++        let mut signal=Signal::connect(&[url],"synthetic-ticket",Duration::from_secs(2),false).await.unwrap();
++        let result=signal.control(json!({}),vec![8,1],Duration::from_secs(2)).await.unwrap();
++        assert_eq!(result,if attached {json!({"payload":"CAE="})} else {json!({})});
++        signal.close().await;
++        server.await.unwrap();
++    }
++}
++
++/// Model a slow Socket.IO binary event while the caller's heartbeat repeatedly
++/// cancels event polling. Both completed attachments and the header must survive.
++#[tokio::test]
++async fn websocket_binary_event_survives_repeated_poll_cancellation() {
++    tokio::time::timeout(Duration::from_secs(5),async {
++        let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await.unwrap();
++        let url=format!("ws://{}",listener.local_addr().unwrap());
++        let (stage_tx,mut stages)=mpsc::channel(2);
++        let (advance_tx,mut advance)=mpsc::channel(2);
++        let server=tokio::spawn(async move {
++            let (stream,_)=listener.accept().await.unwrap();
++            let mut ws=accept_async(stream).await.unwrap();
++            ws.send(Message::Text("0{}".into())).await.unwrap();
++            assert_eq!(ws.next().await.unwrap().unwrap(),Message::Text("40".into()));
++            ws.send(Message::Text("40{}".into())).await.unwrap();
++
++            let header=json!(["soac",{"data":{
++                "first":{"_placeholder":true,"num":0},
++                "second":{"_placeholder":true,"num":1}
++            }}]);
++            ws.send(Message::Text(format!("452-{header}"))).await.unwrap();
++            stage_tx.send(()).await.unwrap();
++            advance.recv().await.unwrap();
++            ws.send(Message::Binary(vec![1,2])).await.unwrap();
++            stage_tx.send(()).await.unwrap();
++            advance.recv().await.unwrap();
++
++            // Heartbeats at either protocol layer must still work while waiting
++            // for a later attachment; a blocked pong would close the room.
++            ws.send(Message::Text("2fixture".into())).await.unwrap();
++            assert_eq!(ws.next().await.unwrap().unwrap(),Message::Text("3fixture".into()));
++            ws.send(Message::Ping(vec![7])).await.unwrap();
++            assert_eq!(ws.next().await.unwrap().unwrap(),Message::Pong(vec![7]));
++            ws.send(Message::Binary(vec![4,0x1f,0x8b,8])).await.unwrap();
++            while ws.next().await.is_some() {}
++        });
++        let mut signal=Signal::connect(&[url],"synthetic-ticket",Duration::from_secs(2),false).await.unwrap();
++
++        // Interrupt after the header, then again after just one attachment.
++        // The old decoder loses the pending packet at the first interruption.
++        stages.recv().await.unwrap();
++        assert!(tokio::time::timeout(Duration::from_millis(20),signal.event()).await.is_err());
++        advance_tx.send(()).await.unwrap();
++        stages.recv().await.unwrap();
++        assert!(tokio::time::timeout(Duration::from_millis(20),signal.event()).await.is_err());
++        advance_tx.send(()).await.unwrap();
++
++        let event=signal.event().await.unwrap();
++        assert_eq!(event,json!(["soac",{"data":{"first":"AQI=","second":"H4sI"}}]));
++        signal.close().await;
++        server.await.unwrap();
++    }).await.expect("binary signaling cancellation regression timed out");
++}
++
+ #[tokio::test]
+ async fn complete_session_uses_loopback_signaling_and_virtual_rtc_through_echo() {
+     tokio::time::timeout(Duration::from_secs(20),async {
 diff --git a/src/viewer/tools/cli.rs b/src/viewer/tools/cli.rs
-index f574e4f..d6c0e67 100644
+index f574e4fbe66ccbbc662bccae2db9502379d9d638..d6c0e671feb9fe9dbbecec87c242e7b5c30137e9 100644
 --- a/src/viewer/tools/cli.rs
 +++ b/src/viewer/tools/cli.rs
 @@ -28,21 +28,33 @@ impl TerminalInput for terminal::Terminal {
@@ -60,10 +352,28 @@ index f574e4f..d6c0e67 100644
              e=output.recv()=>match e{
                  Some(terminal::Event::Output{session,data})if session==id=>{stdout.write_all(&data).await.map_err(|_|"TTY write failed")?;stdout.flush().await.map_err(|_|"TTY flush failed")?;},
 diff --git a/src/viewer_main.rs b/src/viewer_main.rs
-index 06c3c35..7bf48e0 100644
+index 06c3c35dca506161c6f18baf6dd773ba9d5621f6..7a61369cbfae23761d16807a2c776389ef9c719f 100644
 --- a/src/viewer_main.rs
 +++ b/src/viewer_main.rs
-@@ -284,7 +284,12 @@ async fn tool_command(args:&[String])->Result<(),String>{
+@@ -27,7 +27,16 @@ async fn main() {
+     let args:Vec<String>=std::env::args().skip(1).collect();
+     // The terminal tool owns the TTY: diagnostics would interleave with the remote shell's screen.
+     let level=if args.first().is_some_and(|m|matches!(m.as_str(),"terminal"|"terminal-local")){log::LevelFilter::Off}else{log::LevelFilter::Info};
+-    env_logger::Builder::new().filter_level(log::LevelFilter::Off).filter_module("uuremote_viewer",level).init();
++    let mut logger=env_logger::Builder::new();
++    logger.filter_level(log::LevelFilter::Off).filter_module("uuremote_viewer",level);
++    // Opt-in terminal diagnostics use an explicit module allowlist. Never enable
++    // third-party wire logging or include terminal input/output in diagnostics.
++    if std::env::var("UU_TERMINAL_DIAGNOSTICS").is_ok_and(|value|value=="1") {
++        for module in ["uuremote_viewer::viewer::session","uuremote_viewer::viewer::signal"] {
++            logger.filter_module(module,log::LevelFilter::Info);
++        }
++    }
++    logger.init();
+     match run(&args).await {Ok(())=>{},Err(error)=>{eprintln!("{error}");std::process::exit(2)}}
+ }
+ async fn run(args:&[String])->Result<(),String> {
+@@ -284,7 +293,12 @@ async fn tool_command(args:&[String])->Result<(),String>{
              _=>Err("Tool windows require the GTK build".into())}};
          tokio::pin!(operation);
          let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;

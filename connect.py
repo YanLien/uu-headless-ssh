@@ -20,6 +20,15 @@ ROOT = Path(__file__).resolve().parent
 ANSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
 
+def sync_terminal_size(master, source=0):
+    """Propagate Ghostty's size to the nested PTY; use a fallback for pipes."""
+    try:
+        cols, rows = os.get_terminal_size(source)
+    except OSError:
+        cols, rows = 120, 40
+    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", max(1, rows), max(1, cols), 0, 0))
+
+
 def stop_client(pid, master, forward=False, grace=30):
     """Keep the PTY alive while the client deletes its owned remote terminal."""
     try:
@@ -73,11 +82,8 @@ def main():
         command = ["/usr/bin/swift", str(ROOT / "scripts/credentials.swift"),
                    str(ROOT / "bin/uuremote-viewer"), "terminal", device]
         os.execv(command[0], command)
-    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
-    saved = termios.tcgetattr(0) if os.isatty(0) and not args.check else None
-    if saved is not None:
-        tty.setraw(0)
-
+    saved = None
+    previous_resize = None
     data = bytearray()
     sent = False
     expired = False
@@ -90,9 +96,18 @@ def main():
         command = (f"{ssh} {target} 'hostname; id -un; uname -s'; "
                    "$uuExit=$LASTEXITCODE; Write-Output ('__UU_CHECK_' + $uuExit + '__'); exit $uuExit\r")
     else:
-        command = f"{ssh} -tt {target}\r"
+        # Ending Linux must also end this task's PowerShell, so the protocol
+        # client can delete its owned terminal instead of leaving an idle shell.
+        command = f"{ssh} -tt {target}; $uuExit=$LASTEXITCODE; exit $uuExit\r"
 
     try:
+        # Setup failures still need to stop the already-started child. Keep
+        # both geometry and raw-mode setup inside the cleanup scope.
+        sync_terminal_size(master)
+        previous_resize = signal.signal(signal.SIGWINCH, lambda _signal, _frame: sync_terminal_size(master))
+        saved = termios.tcgetattr(0) if os.isatty(0) and not args.check else None
+        if saved is not None:
+            tty.setraw(0)
         while True:
             if (args.check or not sent) and time.monotonic() > deadline:
                 expired = True
@@ -124,8 +139,13 @@ def main():
                     break
                 os.write(master, block)
     finally:
+        if previous_resize is not None:
+            signal.signal(signal.SIGWINCH, previous_resize)
         if saved is not None:
-            termios.tcsetattr(0, termios.TCSADRAIN, saved)
+            try:
+                termios.tcsetattr(0, termios.TCSADRAIN, saved)
+            except termios.error:
+                pass  # Closing the outer window must not skip remote cleanup.
         try:
             child_status = stop_client(pid, master, forward=not args.check)
         finally:
@@ -145,6 +165,9 @@ def main():
             report["client_exit_code"] = child_status
         print(json.dumps(report, ensure_ascii=False))
         return 0 if success else 1
+    if expired:
+        print("Timed out waiting for the Windows terminal.", file=sys.stderr)
+        return 1
     return child_status if child_status >= 0 else 128 - child_status
 
 

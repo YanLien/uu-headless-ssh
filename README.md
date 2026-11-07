@@ -65,10 +65,11 @@ python3 connect.py
 ```
 
 Codex 使用带 PTY 的命令工具启动交互模式，然后通过该工具的 stdin 发送 Linux 命令即可。
-默认入口新建的远端终端归本次任务所有。输入 `exit`、按 `Ctrl+]` 或关闭本地窗口时，程序会主动删除本次新建的会话。
+默认入口新建的远端终端归本次任务所有。在 Linux 中输入 `exit` 后，桥接程序也会结束本次 PowerShell，再清理新建的会话。按 `Ctrl+]` 或关闭本地窗口也会触发清理。
 连接中断时也会尝试清理；原连接不可用时，只建立管理连接删除已确认的会话，不会另开 PowerShell。
 设备离线或网络不可达时无法保证立即删除，程序会报告未完成的清理和已确认的会话 ID。
 Linux 的 zsh 可能把整段输入当作粘贴；命令停留在输入行时，再单独发送一次回车。
+桥接入口会跟随本地终端的窗口尺寸，调整 Ghostty 大小时会更新远端终端。
 
 直接在 Ghostty 等本地终端进入 Windows PowerShell：
 
@@ -78,7 +79,7 @@ uu_device_id=$(python3 -c 'import json; print(json.load(open("config.json"))["uu
 swift scripts/credentials.swift "$PWD/bin/uuremote-viewer" terminal "$uu_device_id"
 ```
 
-此入口停留在 Windows。输入 `exit` 正常结束远端 PowerShell。
+此入口停留在 Windows。输入 `exit` 正常结束远端 PowerShell；`Ctrl+]` 只作为本地断开键，不发送给远端 shell。
 
 查看现有会话，不创建 PowerShell：
 
@@ -94,7 +95,7 @@ swift scripts/credentials.swift "$PWD/bin/uuremote-viewer" terminal "$uu_device_
 
 接入已有会话后，断开时只分离连接，保留会话。需要保留正在运行的程序时，关闭本地窗口或用 `Ctrl+]` 断开；输入 `exit` 会由远端 shell 自身结束程序。
 终端管理命令还支持 `terminal-kill DEVICE SESSION_ID...`，用于明确结束选中的会话及其中的程序。
-自动清理只删除能确认由本次调用新建的会话，不会清空其他会话；多个会话同时新建导致归属不明时会报错。
+自动清理只删除能确认由本次调用新建的会话，不会清空其他会话。首次清单无法唯一识别新会话，或读取被中断时，会报错并保留归属不明的会话；不会用后续清单重新猜测归属。
 
 如连接意外结束，可在上面的 `swift` 命令前加 `UU_TERMINAL_DIAGNOSTICS=1`：
 
@@ -146,7 +147,7 @@ python3 scripts/build.py --release
 ## 验证与限制
 
 已在 macOS + UU 4.46.0 → Windows / OpenSSH 9.5 → Ubuntu 24.04 的真实链路验证 SSH 和交互式终端。
-适配时运行了上游认证与终端/转发测试。新增本地回归覆盖房间续期、读写取消、任务结束删除、已有会话分离，以及 Python 在清理完成前保持 PTY 存活。
+适配时运行了上游认证与终端/转发测试。新增本地回归覆盖房间续期、读写取消、任务结束删除、已有会话分离、归属不明时禁止重试、断开键不转发，以及 Python 在清理完成前保持 PTY 存活和窗口尺寸同步。
 本地模拟验证不代表长时间实机连接已通过；信令房间仍可能由服务端主动关闭。
 
 上游回归测试命令（在 `.build/upstream` 中运行）：

@@ -601,7 +601,7 @@ index 5cc95bb0116d52c45997e1ee050ae71dc18630a1..8b35928c612c5a5fbd17d4f049eb1f93
  async fn complete_session_uses_loopback_signaling_and_virtual_rtc_through_echo() {
      tokio::time::timeout(Duration::from_secs(20),async {
 diff --git a/src/viewer/tools/cli.rs b/src/viewer/tools/cli.rs
-index f574e4fbe66ccbbc662bccae2db9502379d9d638..469168af47cb4fd1252a992eafd483b91b7de32d 100644
+index f574e4fbe66ccbbc662bccae2db9502379d9d638..5ffad5fc77989bd8d3753be17878efcbfd1c8f6d 100644
 --- a/src/viewer/tools/cli.rs
 +++ b/src/viewer/tools/cli.rs
 @@ -13,10 +13,17 @@ impl Tty {
@@ -626,10 +626,18 @@ index f574e4fbe66ccbbc662bccae2db9502379d9d638..469168af47cb4fd1252a992eafd483b9
  }
  #[async_trait::async_trait]
  pub trait TerminalInput:Sync {
-@@ -28,21 +35,33 @@ impl TerminalInput for terminal::Terminal {
+@@ -28,21 +35,41 @@ impl TerminalInput for terminal::Terminal {
      async fn write(&self,id:u32,data:&[u8])->Result<(),String>{self.write(id,data).await}
      async fn resize(&self,id:u32,cols:u16,rows:u16)->Result<(),String>{self.resize(id,cols,rows).await}
  }
++
++/// Ctrl+] ends the local attachment, including for an existing session. Consume
++/// it here so the shell cannot receive the detach key as remote input.
++pub async fn forward_terminal_input(t:&impl TerminalInput,id:u32,data:&[u8])->Result<bool,String> {
++    if data.is_empty() || data.contains(&0x1d) {return Ok(false)}
++    t.write(id,data).await?;
++    Ok(true)
++}
 +
 +/// Keep reads cancellable when the remote session exits. macOS does not let
 +/// kqueue watch the synthetic /dev/tty descriptor, so poll nonblocking reads
@@ -663,11 +671,11 @@ index f574e4fbe66ccbbc662bccae2db9502379d9d638..469168af47cb4fd1252a992eafd483b9
 -                    match ready.try_io(|fd|std::io::Read::read(&mut fd.get_ref(),&mut buf)){Ok(n)=>break n,Err(_)=>continue}
 -                }
 -            }=>{let n=n.map_err(|_|"TTY read failed")?;if n==0{break}t.write(id,&buf[..n]).await?;},
-+            n=read_tty(&mut input,&mut buf)=>{let n=n.map_err(|_|"TTY read failed")?;if n==0{break}t.write(id,&buf[..n]).await?;},
++            n=read_tty(&mut input,&mut buf)=>{let n=n.map_err(|_|"TTY read failed")?;if !forward_terminal_input(t,id,&buf[..n]).await?{break}},
              _=resize.recv()=>{let(c,r)=size();t.resize(id,c,r).await?;},
              e=output.recv()=>match e{
                  Some(terminal::Event::Output{session,data})if session==id=>{stdout.write_all(&data).await.map_err(|_|"TTY write failed")?;stdout.flush().await.map_err(|_|"TTY flush failed")?;},
-@@ -71,3 +90,23 @@ pub async fn portmap(io:Transport,rx:mpsc::Receiver<Packet>,local:u16,host:&str,
+@@ -71,3 +98,23 @@ pub async fn portmap(io:Transport,rx:mpsc::Receiver<Packet>,local:u16,host:&str,
      let result=tokio::select!{r=tokio::signal::ctrl_c()=>r.map_err(|_|"Cannot watch interrupt".to_owned()),_=p.closed()=>Err("Forwarding transport closed".into())};
      p.remove_rule(id).await?;result
  }
@@ -693,10 +701,10 @@ index f574e4fbe66ccbbc662bccae2db9502379d9d638..469168af47cb4fd1252a992eafd483b9
 +}
 diff --git a/src/viewer/tools/lifecycle.rs b/src/viewer/tools/lifecycle.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..f353f58fed1778dad8bf9c1b0b98b24282838202
+index 0000000000000000000000000000000000000000..e9d268b2edf41142e7b8d27093858a42eeeb9e45
 --- /dev/null
 +++ b/src/viewer/tools/lifecycle.rs
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,150 @@
 +//! A terminal created for one command belongs to that command. Keep cleanup
 +//! outside its cancellable I/O future so signaling errors cannot skip deletion.
 +use super::terminal::Terminal;
@@ -723,6 +731,10 @@ index 0000000000000000000000000000000000000000..f353f58fed1778dad8bf9c1b0b98b242
 +
 +    /// Stable LIST id confirmed to have been created by this invocation.
 +    owned: Option<u32>,
++
++    /// Only the first post-OPEN inventory belongs to the observation window.
++    /// Failure or cancellation must not let a later singleton acquire ownership.
++    identification_started: bool,
 +}
 +
 +fn ids(rows: &[Value]) -> HashSet<u32> {
@@ -745,6 +757,7 @@ index 0000000000000000000000000000000000000000..f353f58fed1778dad8bf9c1b0b98b242
 +            existing,
 +            wire: None,
 +            owned: None,
++            identification_started: false,
 +        });
 +    }
 +
@@ -781,25 +794,28 @@ index 0000000000000000000000000000000000000000..f353f58fed1778dad8bf9c1b0b98b242
 +    /// error rather than permission to terminate someone else's session.
 +    pub async fn identify(&self) -> Result<(), String> {
 +        let (terminal, before) = {
-+            let guard = self.0.lock().unwrap();
-+            let Some(tracked) = guard.as_ref() else {
++            let mut guard = self.0.lock().unwrap();
++            let Some(tracked) = guard.as_mut() else {
 +                return Ok(());
 +            };
 +            if tracked.existing || tracked.owned.is_some() || tracked.wire.is_none() {
 +                return Ok(());
 +            }
++            if tracked.identification_started {
++                return Err("Terminal ownership was not confirmed by the first inventory".into());
++            }
++            // Set this before awaiting LIST. Cancellation loses the original
++            // snapshot too; a later retry could identify another user's shell.
++            tracked.identification_started = true;
 +            (tracked.terminal.clone(), tracked.before.clone())
 +        };
 +        let after = ids(&terminal.list_sessions().await?);
 +        let created: Vec<_> = after.difference(&before).copied().collect();
-+        if created.len() > 1 {
++        if created.len() != 1 {
 +            return Err("Cannot identify the newly created terminal safely".into());
 +        }
 +        if let Some(tracked) = self.0.lock().unwrap().as_mut() {
 +            tracked.owned = created.first().copied();
-+            if created.is_empty() {
-+                tracked.existing = true;
-+            }
 +        }
 +        Ok(())
 +    }
@@ -914,10 +930,10 @@ index 6af986b358655efbf69a2945fba7c6f5374418ee..9ea9b3570eec4e47f672fd163ea215a5
  }
  
 diff --git a/src/viewer/tools/tests.rs b/src/viewer/tools/tests.rs
-index 3696fe4b8e459517c562060ac9dd4ffad097b3c3..4d8ce3ed480883b22d8411e64d36155d4372ef17 100644
+index 3696fe4b8e459517c562060ac9dd4ffad097b3c3..e46c7fdc9d6aea0fd8ee198b8f76afda63a2a090 100644
 --- a/src/viewer/tools/tests.rs
 +++ b/src/viewer/tools/tests.rs
-@@ -192,3 +192,198 @@ async fn terminal_kill_acknowledgement_and_empty_refresh(){
+@@ -192,3 +192,292 @@ async fn terminal_kill_acknowledgement_and_empty_refresh(){
      });
      t.kill(42).await.unwrap();assert!(t.list_sessions().await.unwrap().is_empty());host.await.unwrap();
  }
@@ -1115,6 +1131,100 @@ index 3696fe4b8e459517c562060ac9dd4ffad097b3c3..4d8ce3ed480883b22d8411e64d36155d
 +    assert!(terminal.list_sessions().await.unwrap().is_empty());
 +    terminal.kill(9).await.unwrap();
 +    server.await.unwrap();
++}
++
++/// A later inventory may leave just somebody else's new session after our
++/// shell has exited. Once the first snapshot is ambiguous or empty, cleanup
++/// must retain that uncertainty instead of deleting the later singleton.
++#[tokio::test]
++async fn uncertain_terminal_ownership_is_never_retried() {
++    for first in [
++        serde_json::json!([{"session_id":7},{"session_id":8},{"session_id":9}]),
++        serde_json::json!([{"session_id":7}]),
++    ] {
++        let (io,rx,input,mut out)=pair();
++        let (terminal,_events)=terminal::Terminal::new(io,rx);
++        let terminal=Arc::new(terminal);
++        let cleanup=lifecycle::Cleanup::default();
++        cleanup.track(terminal.clone(),false,&[serde_json::json!({"session_id":7})]);
++        cleanup.opened(0);
++        let server=tokio::spawn(async move {
++            let mut requests=Vec::new();
++            while let Some((_,data))=out.recv().await {
++                let frame=crate::terminal::decode(&data).unwrap();
++                requests.push(frame.kind);
++                let response=match frame.kind {
++                    terminal::LIST_REQ=> {
++                        let rows=if requests.len()==1 {first.clone()} else {serde_json::json!([{"session_id":7},{"session_id":9}])};
++                        terminal::encode(terminal::LIST_RESP,frame.session,rows.to_string().as_bytes())
++                    },
++                    terminal::KILL_REQ=>terminal::encode(terminal::KILL_RESP,frame.session,br#"{"code":0}"#),
++                    _=>panic!("unexpected lifecycle request"),
++                };
++                input.send((BINARY,response)).await.unwrap();
++            }
++            requests
++        });
++
++        let initial=cleanup.identify().await;
++        let final_attempt=cleanup.finish().await;
++        cleanup.complete();
++        drop(terminal);
++        let requests=server.await.unwrap();
++
++        assert!(initial.is_err(),"a missing new id cannot confirm ownership either");
++        assert!(final_attempt.is_err(),"uncertainty must survive command cancellation");
++        assert_eq!(requests,vec![terminal::LIST_REQ],"never infer ownership from a later inventory");
++    }
++}
++
++/// Canceling the first inventory request also loses the observation window.
++/// An unrelated session appearing afterward cannot be attributed to our OPEN.
++#[tokio::test]
++async fn canceled_ownership_inventory_is_not_repeated_during_cleanup() {
++    let (io,rx,input,mut out)=pair();
++    let (terminal,_events)=terminal::Terminal::new(io,rx);
++    let terminal=Arc::new(terminal);
++    let cleanup=lifecycle::Cleanup::default();
++    cleanup.track(terminal.clone(),false,&[]);
++    cleanup.opened(0);
++    {
++        let identify=cleanup.identify();
++        tokio::pin!(identify);
++        tokio::select! {
++            result=&mut identify=>panic!("inventory unexpectedly completed: {result:?}"),
++            request=out.recv()=>assert_eq!(crate::terminal::decode(&request.unwrap().1).unwrap().kind,terminal::LIST_REQ),
++        }
++    }
++
++    let result=tokio::time::timeout(Duration::from_millis(30),cleanup.finish()).await;
++    assert!(matches!(result,Ok(Err(_))),"cleanup must reject the lost observation immediately");
++    assert!(out.try_recv().is_err(),"cleanup must not send a new inventory query");
++    cleanup.complete();
++    drop(input);
++}
++
++/// Exercise the real TERM writer with a local transport: ordinary input and
++/// Ctrl+C reach the shell, while EOF and Ctrl+] end only the attachment.
++#[tokio::test]
++async fn terminal_detach_shortcut_never_reaches_the_remote_shell() {
++    let (io,rx,_input,mut out)=pair();
++    let (terminal,_events)=terminal::Terminal::new(io,rx);
++
++    for data in [b"pwd\r".as_slice(),b"\x03".as_slice()] {
++        assert!(cli::forward_terminal_input(&terminal,7,data).await.unwrap());
++        let (channel,bytes)=out.recv().await.unwrap();
++        let frame=crate::terminal::decode(&bytes).unwrap();
++        assert_eq!(channel,BINARY);
++        assert_eq!((frame.kind,frame.session),(terminal::STDIN,7));
++        assert_eq!(frame.payload,data);
++    }
++    for data in [b"\x1d".as_slice(),b"pasted\x1dtext".as_slice(),b"".as_slice()] {
++        assert!(!cli::forward_terminal_input(&terminal,7,data).await.unwrap());
++    }
++
++    drop(terminal);
++    assert!(out.recv().await.is_none(),"the local detach key must not be sent as STDIN");
 +}
 diff --git a/src/viewer_main.rs b/src/viewer_main.rs
 index 06c3c35dca506161c6f18baf6dd773ba9d5621f6..b92ab7e878f40f8f3b6cc8372bc9a64b335a0841 100644

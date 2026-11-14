@@ -79,8 +79,7 @@ def main():
     # without a desktop window, screen capture, accessibility API or mouse input.
     pid, master = pty.fork()
     if pid == 0:
-        command = ["/usr/bin/swift", str(ROOT / "scripts/credentials.swift"),
-                   str(ROOT / "bin/uuremote-viewer"), "terminal", device]
+        command = [sys.executable, str(ROOT / "scripts/terminal.py"), "--device", device]
         os.execv(command[0], command)
     saved = None
     previous_resize = None

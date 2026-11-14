@@ -15,10 +15,43 @@ index 13302ad2099aa7c3f734997e0b9c95d387f51e45..431d5413ba9052ffc448ffcdd0e9b289
          if missing.is_empty() { Ok(creds) } else { Err(format!("missing credential settings: {}", missing.join(", "))) }
      }
 diff --git a/src/viewer/session.rs b/src/viewer/session.rs
-index e850812138da1cb686b488a7c43bdc9ff84fb4c6..afa956c44c5492814f5c39680b6306281c3793af 100644
+index e850812138da1cb686b488a7c43bdc9ff84fb4c6..0e9e9c575f20037f409ae0fc7f041f1f563ef4f2 100644
 --- a/src/viewer/session.rs
 +++ b/src/viewer/session.rs
-@@ -60,7 +60,12 @@ impl Session {
+@@ -4,6 +4,23 @@ use std::{sync::atomic::Ordering,time::Duration};
+ use tokio::sync::mpsc;
+ use webrtc::api::setting_engine::SettingEngine;
+ 
++/// Keep signaling alive across readiness polls and heartbeats. Recreating
++/// Session::step on every tick can discard an already-received SDP while
++/// WebRTC is still applying it. Cancel these futures only when the command ends.
++pub async fn drive_tools(
++    operation:impl std::future::Future<Output=Result<(),String>>,
++    signaling:impl std::future::Future<Output=Result<(),String>>,
++    heartbeat:impl std::future::Future<Output=Result<(),String>>,
++    stopped:impl std::future::Future<Output=()>,
++)->Result<(),String> {
++    tokio::select! {
++        result=operation=>result,
++        result=signaling=>result,
++        result=heartbeat=>result,
++        _=stopped=>Ok(()),
++    }
++}
++
+ pub struct Options {pub timeout:Duration,pub legacy_prefix:bool,pub ready_policy:ReadyPolicy,pub clipboard:super::clipboard::Bridge}
+ pub struct Session {pub peer:Peer,signal:Signal,candidates:mpsc::Receiver<Value>,policy:ReadyPolicy}
+ impl Session {
+@@ -25,7 +42,7 @@ impl Session {
+                 log::info!("Control ack ICE entries: {:?}",summary);
+             }
+             // Structure and relations only; never the ids or ICE credentials.
+-            log::info!("Control ack shape={} app_control_id_matches={:?} ice_id_matches={:?}",crate::protocol::json_shape(&result,5),
++            log::info!("Control ack keys={:?} app_control_id_matches={:?} ice_id_matches={:?}",result.as_object().map(|body|body.keys().collect::<Vec<_>>()),
+                 result.get("app_control_id").map(|v|v.as_str()==Some(app.as_str())),result.get("ice_id").map(|v|v.as_str()==Some(ice.as_str())));
+             if result.get("app_control_id").is_some_and(|v|v.as_str()!=Some(app.as_str())) {return Err("Control acknowledgement belongs to another session".into())}
+             // Observed live: the cloud assigns the session ice_id in this ack rather than echoing ours.
+@@ -60,7 +77,12 @@ impl Session {
                      Some("soac")=>if let Some(body)=event.get(1) {self.peer.receive(body).await?},
                      Some("released"|"left"|"leave")=> {
                          // An event for another peer must not tear down this session.
@@ -33,7 +66,7 @@ index e850812138da1cb686b488a7c43bdc9ff84fb4c6..afa956c44c5492814f5c39680b630628
                      _=>{},
                  }
 diff --git a/src/viewer/signal.rs b/src/viewer/signal.rs
-index b87d872b959209dac4e126a1892312e8a9cd267a..9882c28966db37477c1766affbb4945eb611772b 100644
+index b87d872b959209dac4e126a1892312e8a9cd267a..0948a70035145af62e4c556b5ebbd16a92c79d4d 100644
 --- a/src/viewer/signal.rs
 +++ b/src/viewer/signal.rs
 @@ -1,17 +1,39 @@
@@ -151,7 +184,18 @@ index b87d872b959209dac4e126a1892312e8a9cd267a..9882c28966db37477c1766affbb4945e
      pub async fn control(&mut self, header:Value, app_data:Vec<u8>, timeout:Duration)->Result<Value,String> {
          self.next_ack+=1;let id=self.next_ack;
          self.send(Message::Text(format!("451-{id}{}",serde_json::json!(["control",header])))).await?;
-@@ -61,64 +125,66 @@ impl Signal {
+@@ -48,6 +112,10 @@ impl Signal {
+             loop {
+                 match self.packet().await? {
+                     Packet::Ack(ack,value) if ack==id=> {
++                        // Concurrent connection failures need a structural
++                        // diagnostic without exposing room or TURN credentials.
++                        log::info!("Viewer control acknowledgement: success={} body_keys={:?}",
++                            value.get(0).and_then(Value::as_str)==Some("success"),value.get(1).and_then(Value::as_object).map(|body|body.keys().collect::<Vec<_>>()));
+                         let a=value.as_array().ok_or("Invalid control acknowledgement")?;
+                         if a.len()!=2 || a[0].as_str()!=Some("success") || !a[1].is_object() {return Err("Control refused or malformed acknowledgement".into())}
+                         return Ok(a[1].clone());
+@@ -61,64 +129,66 @@ impl Signal {
              }
          }).await.map_err(|_|"Control acknowledgement timed out")?
      }
@@ -259,7 +303,7 @@ index b87d872b959209dac4e126a1892312e8a9cd267a..9882c28966db37477c1766affbb4945e
                  // Type, short prefix and length only, to see what else the room delivers.
                  Some(Ok(Message::Text(t)))=>log::info!("Viewer signaling frame ignored: text prefix={} bytes={}",t.chars().take(3).collect::<String>(),t.len()),
                  Some(Ok(Message::Binary(b)))=>log::info!("Viewer signaling frame ignored: binary bytes={}",b.len()),
-@@ -126,11 +192,242 @@ impl Signal {
+@@ -126,11 +196,242 @@ impl Signal {
              }
          }
      }
@@ -503,7 +547,7 @@ index b87d872b959209dac4e126a1892312e8a9cd267a..9882c28966db37477c1766affbb4945e
 +    }
 +}
 diff --git a/src/viewer/tests.rs b/src/viewer/tests.rs
-index 5cc95bb0116d52c45997e1ee050ae71dc18630a1..8b35928c612c5a5fbd17d4f049eb1f9311626a18 100644
+index 5cc95bb0116d52c45997e1ee050ae71dc18630a1..bee77f48d62a94badd5501c4949eb2f2ff158028 100644
 --- a/src/viewer/tests.rs
 +++ b/src/viewer/tests.rs
 @@ -60,6 +60,93 @@ async fn websocket_control_ack_framing_heartbeat_failure_and_timeout() {
@@ -600,6 +644,45 @@ index 5cc95bb0116d52c45997e1ee050ae71dc18630a1..8b35928c612c5a5fbd17d4f049eb1f93
  #[tokio::test]
  async fn complete_session_uses_loopback_signaling_and_virtual_rtc_through_echo() {
      tokio::time::timeout(Duration::from_secs(20),async {
+@@ -211,6 +298,38 @@ async fn closing_one_peer_preserves_another_peer() {
+     second.close().await;router.lock().await.stop().await.unwrap();
+ }
+ 
++/// Applying a received description can span several heartbeat/readiness ticks.
++/// Keep that consumed message's work alive until the application finishes.
++#[tokio::test]
++async fn tool_ticks_do_not_cancel_a_consumed_signaling_message() {
++    use std::sync::atomic::AtomicUsize;
++    let ticks=Arc::new(AtomicUsize::new(0));
++    let counted=ticks.clone();
++    let (received,description)=tokio::sync::oneshot::channel();
++    let (finished,applied)=tokio::sync::oneshot::channel();
++    received.send(()).unwrap();
++
++    let signaling=async {
++        description.await.map_err(|_|"description missing".to_owned())?;
++        tokio::time::sleep(Duration::from_millis(40)).await;
++        let _=finished.send(());
++        std::future::pending::<Result<(),String>>().await
++    };
++    let heartbeat=async move {
++        loop {
++            tokio::time::sleep(Duration::from_millis(1)).await;
++            counted.fetch_add(1,Ordering::Relaxed);
++        }
++    };
++    let operation=async {applied.await.map_err(|_|"description application canceled".to_owned())};
++    let result=tokio::time::timeout(Duration::from_secs(1),super::session::drive_tools(
++        operation,signaling,heartbeat,std::future::pending(),
++    )).await.unwrap();
++
++    result.unwrap();
++    assert!(ticks.load(Ordering::Relaxed)>2,"signaling must survive repeated timer activity");
++}
++
+ #[tokio::test]
+ async fn opus_and_video_tracks_are_received_independently_in_memory() {
+     tokio::time::timeout(Duration::from_secs(10),async {
 diff --git a/src/viewer/tools/cli.rs b/src/viewer/tools/cli.rs
 index f574e4fbe66ccbbc662bccae2db9502379d9d638..5ffad5fc77989bd8d3753be17878efcbfd1c8f6d 100644
 --- a/src/viewer/tools/cli.rs
@@ -701,10 +784,10 @@ index f574e4fbe66ccbbc662bccae2db9502379d9d638..5ffad5fc77989bd8d3753be17878efcb
 +}
 diff --git a/src/viewer/tools/lifecycle.rs b/src/viewer/tools/lifecycle.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..e9d268b2edf41142e7b8d27093858a42eeeb9e45
+index 0000000000000000000000000000000000000000..7d5162a4110584f8b29e0e9b2002c8bbe1dd73d9
 --- /dev/null
 +++ b/src/viewer/tools/lifecycle.rs
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,173 @@
 +//! A terminal created for one command belongs to that command. Keep cleanup
 +//! outside its cancellable I/O future so signaling errors cannot skip deletion.
 +use super::terminal::Terminal;
@@ -715,7 +798,12 @@ index 0000000000000000000000000000000000000000..e9d268b2edf41142e7b8d27093858a42
 +};
 +
 +#[derive(Clone, Default)]
-+pub struct Cleanup(Arc<Mutex<Option<Tracked>>>);
++pub struct Cleanup {
++    state: Arc<Mutex<Option<Tracked>>>,
++
++    /// Client disconnect and transport shutdown may race to perform cleanup.
++    finishing: Arc<tokio::sync::Mutex<()>>,
++}
 +
 +struct Tracked {
 +    terminal: Arc<Terminal>,
@@ -751,7 +839,7 @@ index 0000000000000000000000000000000000000000..e9d268b2edf41142e7b8d27093858a42
 +impl Cleanup {
 +    /// Register the pre-OPEN inventory and retain the worker across cancellation.
 +    pub fn track(&self, terminal: Arc<Terminal>, existing: bool, before: &[Value]) {
-+        *self.0.lock().unwrap() = Some(Tracked {
++        *self.state.lock().unwrap() = Some(Tracked {
 +            terminal,
 +            before: ids(before),
 +            existing,
@@ -763,7 +851,7 @@ index 0000000000000000000000000000000000000000..e9d268b2edf41142e7b8d27093858a42
 +
 +    /// Record a successful OPEN acknowledgement before any further await.
 +    pub fn opened(&self, id: u32) {
-+        if let Some(tracked) = self.0.lock().unwrap().as_mut() {
++        if let Some(tracked) = self.state.lock().unwrap().as_mut() {
 +            tracked.wire = Some(id);
 +            if !tracked.existing && id != 0 {
 +                if tracked.before.contains(&id) {
@@ -777,7 +865,7 @@ index 0000000000000000000000000000000000000000..e9d268b2edf41142e7b8d27093858a42
 +
 +    /// Return only a confirmed owned id for cleanup over a fresh management peer.
 +    pub fn owned(&self) -> Option<u32> {
-+        self.0
++        self.state
 +            .lock()
 +            .unwrap()
 +            .as_ref()
@@ -786,7 +874,7 @@ index 0000000000000000000000000000000000000000..e9d268b2edf41142e7b8d27093858a42
 +
 +    /// Forget ownership only after cleanup succeeded or was explicitly resolved.
 +    pub fn complete(&self) {
-+        self.0.lock().unwrap().take();
++        self.state.lock().unwrap().take();
 +    }
 +
 +    /// Windows OPEN may acknowledge only success, with wire id zero. Compare
@@ -794,7 +882,7 @@ index 0000000000000000000000000000000000000000..e9d268b2edf41142e7b8d27093858a42
 +    /// error rather than permission to terminate someone else's session.
 +    pub async fn identify(&self) -> Result<(), String> {
 +        let (terminal, before) = {
-+            let mut guard = self.0.lock().unwrap();
++            let mut guard = self.state.lock().unwrap();
 +            let Some(tracked) = guard.as_mut() else {
 +                return Ok(());
 +            };
@@ -814,7 +902,7 @@ index 0000000000000000000000000000000000000000..e9d268b2edf41142e7b8d27093858a42
 +        if created.len() != 1 {
 +            return Err("Cannot identify the newly created terminal safely".into());
 +        }
-+        if let Some(tracked) = self.0.lock().unwrap().as_mut() {
++        if let Some(tracked) = self.state.lock().unwrap().as_mut() {
 +            tracked.owned = created.first().copied();
 +        }
 +        Ok(())
@@ -823,8 +911,9 @@ index 0000000000000000000000000000000000000000..e9d268b2edf41142e7b8d27093858a42
 +    /// Explicitly attached sessions are detached. New sessions are removed with
 +    /// KILL, while an already-exited shell needs no further action.
 +    pub async fn finish(&self) -> Result<(), String> {
++        let _guard = self.finishing.lock().await;
 +        self.identify().await?;
-+        let snapshot = self.0.lock().unwrap().as_ref().map(|tracked| {
++        let snapshot = self.state.lock().unwrap().as_ref().map(|tracked| {
 +            (
 +                tracked.terminal.clone(),
 +                tracked.existing,
@@ -853,6 +942,23 @@ index 0000000000000000000000000000000000000000..e9d268b2edf41142e7b8d27093858a42
 +        }
 +        self.complete();
 +        Ok(())
++    }
++}
++
++/// Retain every live client's ownership outside the server's cancellable I/O.
++/// Completed entries release their terminal worker and can be pruned safely.
++#[derive(Clone, Default)]
++pub struct Registry(Arc<Mutex<Vec<Cleanup>>>);
++
++impl Registry {
++    pub fn register(&self, cleanup: Cleanup) {
++        let mut entries = self.0.lock().unwrap();
++        entries.retain(|entry| entry.state.lock().unwrap().is_some());
++        entries.push(cleanup);
++    }
++
++    pub fn entries(&self) -> Vec<Cleanup> {
++        self.0.lock().unwrap().clone()
 +    }
 +}
 diff --git a/src/viewer/tools/mod.rs b/src/viewer/tools/mod.rs
@@ -929,6 +1035,1149 @@ index 6af986b358655efbf69a2945fba7c6f5374418ee..9ea9b3570eec4e47f672fd163ea215a5
      }
  }
  
+diff --git a/src/viewer/tools/terminal_ipc.rs b/src/viewer/tools/terminal_ipc.rs
+index addf567fdd4aa99a4992025e14d3016222a0be34..8a19512d8e9bf9cc87fd81aa19cb8f17218e165d 100644
+--- a/src/viewer/tools/terminal_ipc.rs
++++ b/src/viewer/tools/terminal_ipc.rs
+@@ -1,59 +1,348 @@
+-//! Local TTY clients share the list process's Terminal; no cloud credentials cross IPC.
+-use super::{terminal::{Terminal,Event},cli};
+-use std::{path::{Path,PathBuf},sync::Arc};
+-use tokio::{io::{AsyncRead,AsyncReadExt,AsyncWrite,AsyncWriteExt},net::{UnixListener,UnixStream},sync::{broadcast,mpsc,Mutex},task::JoinSet};
+-use serde::{Serialize,Deserialize};
+-const MAX:usize=4*1024*1024+1024;
+-#[derive(Serialize,Deserialize)]
+-enum Message {Open{session:Option<u32>,cols:u16,rows:u16},Ready(u32),Input(Vec<u8>),Resize(u16,u16),Output(Vec<u8>),Exit(i64),Close,Error}
+-async fn read(r:&mut (impl AsyncRead+Unpin))->Result<Message,String>{
+-    let n=r.read_u32().await.map_err(|_|"Local terminal closed")? as usize;
+-    if n>MAX{return Err("Local terminal frame limit".into())}
+-    let mut b=vec![0;n];r.read_exact(&mut b).await.map_err(|_|"Local terminal closed")?;
+-    serde_json::from_slice(&b).map_err(|_|"Invalid local terminal frame".into())
++//! Local TTY clients share one terminal transport; no cloud credentials cross IPC.
++use super::{
++    cli, lifecycle,
++    terminal::{Event, Terminal},
++};
++use serde::{Deserialize, Serialize};
++use std::{
++    path::{Path, PathBuf},
++    sync::Arc,
++};
++use tokio::{
++    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
++    net::{UnixListener, UnixStream},
++    sync::{broadcast, mpsc, Mutex},
++    task::JoinSet,
++};
++
++const MAX: usize = 4 * 1024 * 1024 + 1024;
++
++#[derive(Serialize, Deserialize)]
++enum Message {
++    Open {
++        session: Option<u32>,
++
++        cols: u16,
++
++        rows: u16,
++    },
++
++    /// The preexisting GUI list process uses the legacy, unscoped handshake.
++    Ready(u32),
++
++    /// Headless clients retain ownership metadata for an interrupted cleanup.
++    ReadyScoped {
++        session: u32,
++
++        owned: Option<u32>,
++    },
++
++    Input(Vec<u8>),
++
++    Resize(u16, u16),
++
++    Output(Vec<u8>),
++
++    Exit(i64),
++
++    Close,
++
++    Error,
++
++    Ping,
++
++    /// Protocol version only; no account identity or credentials cross IPC.
++    Pong(u32),
++
++    List,
++
++    Sessions(Vec<serde_json::Value>),
++
++    Kill(Vec<u32>),
++
++    Killed(Vec<u32>),
++
++    /// Remote cleanup or detach completed, rather than just local TTY closure.
++    Closed,
++
++    Failure(String),
+ }
+-async fn write(w:&mut (impl AsyncWrite+Unpin),m:&Message)->Result<(),String>{
+-    let b=serde_json::to_vec(m).map_err(|_|"Invalid local terminal frame")?;
+-    if b.len()>MAX{return Err("Local terminal frame limit".into())}
+-    w.write_u32(b.len() as u32).await.map_err(|_|"Local terminal closed")?;
+-    w.write_all(&b).await.map_err(|_|"Local terminal closed".into())
++
++async fn read(r: &mut (impl AsyncRead + Unpin)) -> Result<Message, String> {
++    let n = r.read_u32().await.map_err(|_| "Local terminal closed")? as usize;
++    if n > MAX {
++        return Err("Local terminal frame limit".into());
++    }
++    let mut b = vec![0; n];
++    r.read_exact(&mut b)
++        .await
++        .map_err(|_| "Local terminal closed")?;
++    serde_json::from_slice(&b).map_err(|_| "Invalid local terminal frame".into())
++}
++
++async fn write(w: &mut (impl AsyncWrite + Unpin), m: &Message) -> Result<(), String> {
++    let b = serde_json::to_vec(m).map_err(|_| "Invalid local terminal frame")?;
++    if b.len() > MAX {
++        return Err("Local terminal frame limit".into());
++    }
++    w.write_u32(b.len() as u32)
++        .await
++        .map_err(|_| "Local terminal closed")?;
++    w.write_all(&b)
++        .await
++        .map_err(|_| "Local terminal closed".into())
+ }
+-pub struct Server {dir:PathBuf,pub path:PathBuf,listener:UnixListener}
+-impl Drop for Server {fn drop(&mut self){let _=std::fs::remove_file(&self.path);let _=std::fs::remove_dir(&self.dir);}}
++
++pub struct Server {
++    dir: PathBuf,
++
++    pub path: PathBuf,
++
++    listener: UnixListener,
++}
++
++impl Drop for Server {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_file(&self.path);
++        let _ = std::fs::remove_dir(&self.dir);
++    }
++}
++
+ impl Server {
+-    pub fn new()->Result<Self,String>{
++    /// Bind only inside a directory private to this user. A stale socket may be
++    /// replaced while the caller holds the inherited per-device process lock.
++    pub fn at(path: &Path) -> Result<Self, String> {
++        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
++        let dir = path.parent().ok_or("Missing shared terminal directory")?;
++        let metadata = std::fs::symlink_metadata(dir)
++            .map_err(|_| "Cannot inspect shared terminal directory")?;
++        if !metadata.is_dir()
++            || metadata.uid() != unsafe { libc::geteuid() }
++            || metadata.mode() & 0o077 != 0
++        {
++            return Err("Shared terminal directory is not private".into());
++        }
++        match std::fs::symlink_metadata(path) {
++            Ok(metadata)
++                if metadata.file_type().is_socket()
++                    && metadata.uid() == unsafe { libc::geteuid() } =>
++            {
++                std::fs::remove_file(path).map_err(|_| "Cannot remove stale terminal socket")?;
++            }
++            Ok(_) => return Err("Refusing to replace a non-socket terminal path".into()),
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
++            Err(_) => return Err("Cannot inspect shared terminal socket".into()),
++        }
++        let listener =
++            UnixListener::bind(path).map_err(|_| "Cannot bind shared terminal socket")?;
++        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
++            .map_err(|_| "Cannot protect shared terminal socket")?;
++        Ok(Self {
++            dir: dir.to_owned(),
++            path: path.to_owned(),
++            listener,
++        })
++    }
++
++    pub fn new() -> Result<Self, String> {
+         use std::os::unix::fs::DirBuilderExt;
+-        let dir=std::env::temp_dir().join(format!("uu-tty-{}",super::super::wire::uuid()));
+-        std::fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|_|"Cannot create private terminal directory")?;
+-        let path=dir.join("tty");
+-        match UnixListener::bind(&path){Ok(listener)=>Ok(Self{dir,path,listener}),Err(_)=>{let _=std::fs::remove_dir(dir);Err("Cannot bind local terminal socket".into())}}
++        let dir = std::env::temp_dir().join(format!("uu-tty-{}", super::super::wire::uuid()));
++        std::fs::DirBuilder::new()
++            .mode(0o700)
++            .create(&dir)
++            .map_err(|_| "Cannot create private terminal directory")?;
++        let path = dir.join("tty");
++        match UnixListener::bind(&path) {
++            Ok(listener) => Ok(Self {
++                dir,
++                path,
++                listener,
++            }),
++            Err(_) => {
++                let _ = std::fs::remove_dir(dir);
++                Err("Cannot bind local terminal socket".into())
++            }
++        }
+     }
+-    pub async fn run(self,t:Arc<Terminal>,events:broadcast::Sender<Event>){
+-        let opening=Arc::new(Mutex::new(()));let active=Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));let mut clients=JoinSet::new();
+-        loop{tokio::select!{
+-            accepted=self.listener.accept(),if clients.len()<16=>match accepted{
+-                Ok((socket,_))=>{let(t,opening,active,output)=(t.clone(),opening.clone(),active.clone(),events.subscribe());clients.spawn(async move{let _=serve(socket,t,opening,active,output).await;});},
+-                Err(_)=>break,
+-            },
+-            _=clients.join_next(),if !clients.is_empty()=>{},
+-        }}
++
++    pub async fn run(self, t: Arc<Terminal>, events: broadcast::Sender<Event>) {
++        let opening = Arc::new(Mutex::new(()));
++        let active = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
++        let mut clients = JoinSet::new();
++        loop {
++            tokio::select! {
++                accepted=self.listener.accept(),if clients.len()<16=>match accepted{
++                    Ok((socket,_))=>{let(t,opening,active,output)=(t.clone(),opening.clone(),active.clone(),events.subscribe());clients.spawn(async move{let _=serve(socket,t,opening,active,output,None).await;});},
++                    Err(_)=>break,
++                },
++                _=clients.join_next(),if !clients.is_empty()=>{},
++            }
++        }
+     }
++
++    /// All local terminals and management requests use this one UU peer. Stop
++    /// after a short idle period; no always-running service is installed.
++    pub async fn run_headless(
++        self,
++        t: Arc<Terminal>,
++        events: broadcast::Sender<Event>,
++        registry: lifecycle::Registry,
++    ) -> Result<(), String> {
++        self.run_headless_idle(t, events, registry, std::time::Duration::from_secs(10))
++            .await
++    }
++
++    async fn run_headless_idle(
++        self,
++        t: Arc<Terminal>,
++        events: broadcast::Sender<Event>,
++        registry: lifecycle::Registry,
++        idle_timeout: std::time::Duration,
++    ) -> Result<(), String> {
++        let opening = Arc::new(Mutex::new(()));
++        let active = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
++        let mut clients = JoinSet::new();
++        let mut idle = tokio::time::Instant::now() + idle_timeout;
++        loop {
++            tokio::select! {
++                accepted=self.listener.accept(),if clients.len()<32=>{
++                    let (socket,_)=accepted.map_err(|_|"Shared terminal listener failed")?;
++                    let(t,opening,active,output,registry)=(t.clone(),opening.clone(),active.clone(),events.subscribe(),registry.clone());
++                    clients.spawn(async move{let _=serve(socket,t,opening,active,output,Some(registry)).await;});
++                },
++                _=clients.join_next(),if !clients.is_empty()=>{
++                    if clients.is_empty(){idle=tokio::time::Instant::now()+idle_timeout;}
++                },
++                _=tokio::time::sleep_until(idle),if clients.is_empty()=>return Ok(()),
++            }
++        }
++    }
++}
++
++type Sessions = Arc<std::sync::Mutex<std::collections::HashSet<u32>>>;
++
++struct Active {
++    id: u32,
++
++    sessions: Sessions,
+ }
+-type Sessions=Arc<std::sync::Mutex<std::collections::HashSet<u32>>>;
+-struct Active {id:u32,sessions:Sessions}
+-impl Drop for Active {fn drop(&mut self){self.sessions.lock().unwrap().remove(&self.id);}}
+-async fn serve<S:AsyncRead+AsyncWrite+Unpin+Send+'static>(mut socket:S,t:Arc<Terminal>,opening:Arc<Mutex<()>>,active:Sessions,mut output:broadcast::Receiver<Event>)->Result<(),String>{
+-    let first=tokio::time::timeout(super::TIMEOUT,read(&mut socket)).await.map_err(|_|"Local terminal open timeout")??;
+-    let Message::Open{session,cols,rows}=first else{return Err("Expected local terminal open".into())};
+-    let id={let _guard=opening.lock().await;
+-        if session.is_some_and(|id|active.lock().unwrap().contains(&id)){return Err("Terminal session already attached locally".into())}
++
++impl Drop for Active {
++    fn drop(&mut self) {
++        self.sessions.lock().unwrap().remove(&self.id);
++    }
++}
++
++async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
++    mut socket: S,
++    t: Arc<Terminal>,
++    opening: Arc<Mutex<()>>,
++    active: Sessions,
++    mut output: broadcast::Receiver<Event>,
++    registry: Option<lifecycle::Registry>,
++) -> Result<(), String> {
++    let first = tokio::time::timeout(super::TIMEOUT, read(&mut socket))
++        .await
++        .map_err(|_| "Local terminal open timeout")??;
++    match first {
++        Message::Ping => return write(&mut socket, &Message::Pong(1)).await,
++        Message::List => {
++            let response = match t.list_sessions().await {
++                Ok(rows) => Message::Sessions(rows),
++                Err(error) => Message::Failure(error),
++            };
++            return write(&mut socket, &response).await;
++        }
++        Message::Kill(ref ids) => {
++            if ids.is_empty() || ids.len() > 128 || ids.contains(&0) {
++                return write(
++                    &mut socket,
++                    &Message::Failure("Invalid terminal session ids".into()),
++                )
++                .await;
++            }
++            let _guard = opening.lock().await;
++            let result = async {
++                for id in ids {
++                    if t.list_sessions()
++                        .await?
++                        .iter()
++                        .any(|row| row["session_id"].as_u64() == Some(*id as u64))
++                    {
++                        if let Err(error) = t.kill(*id).await {
++                            if t.list_sessions()
++                                .await?
++                                .iter()
++                                .any(|row| row["session_id"].as_u64() == Some(*id as u64))
++                            {
++                                return Err(error);
++                            }
++                        }
++                    }
++                }
++                Ok::<_, String>(())
++            }
++            .await;
++            return write(
++                &mut socket,
++                &match result {
++                    Ok(()) => Message::Killed(ids.clone()),
++                    Err(error) => Message::Failure(error),
++                },
++            )
++            .await;
++        }
++        _ => {}
++    }
++    let Message::Open {
++        session,
++        cols,
++        rows,
++    } = first
++    else {
++        return Err("Expected local terminal open".into());
++    };
++    let cleanup = lifecycle::Cleanup::default();
++    let opened=async {
++        let _guard=opening.lock().await;
++        if session==Some(0) || session.is_some_and(|id|active.lock().unwrap().contains(&id)) {
++            return Err("Terminal session already attached locally or invalid".to_owned())
++        }
++        if registry.is_some() && active.lock().unwrap().contains(&0) {
++            return Err("This host uses legacy session addressing; another terminal cannot be opened safely".into())
++        }
++        if let Some(registry)=&registry {
++            let before=if session.is_none(){t.list_sessions().await?}else{Vec::new()};
++            cleanup.track(t.clone(),session.is_some(),&before);
++            registry.register(cleanup.clone());
++        }
+         let id=match session{Some(id)=>t.attach(id,cols,rows).await?,None=>t.open(cols,rows).await?};
+-        active.lock().unwrap().insert(id);id
++        if registry.is_some(){cleanup.opened(id);cleanup.identify().await?;}
++        active.lock().unwrap().insert(id);
++        Ok::<_,String>(id)
++    }.await;
++    let id = match opened {
++        Ok(id) => id,
++        Err(error) => {
++            let cleaned =
++                tokio::time::timeout(std::time::Duration::from_secs(5), cleanup.finish()).await;
++            let error = match (cleaned, cleanup.owned()) {
++                (Ok(Ok(())), _) => error,
++                (_, Some(id)) => format!("{error}; terminal cleanup pending: session_id={id}"),
++                _ => error,
++            };
++            let _ = write(&mut socket, &Message::Failure(error.clone())).await;
++            return Err(error);
++        }
+     };
+-    let _active=Active{id,sessions:active};
++    let _active = Active {
++        id,
++        sessions: active,
++    };
++    let (mut r, mut w) = tokio::io::split(socket);
+     let result=async{
+-        write(&mut socket,&Message::Ready(id)).await?;
+-        let(mut r,mut w)=tokio::io::split(socket);let(tx,mut commands)=mpsc::channel(32);
++        write(&mut w,&if registry.is_some(){Message::ReadyScoped{session:id,owned:cleanup.owned()}}else{Message::Ready(id)}).await?;
++        let(tx,mut commands)=mpsc::channel(32);
+         let _reader=super::Abort(tokio::spawn(async move{loop{
+             let message=read(&mut r).await;let failed=message.is_err();
+             if tx.send(message).await.is_err() || failed{break}
+@@ -71,82 +360,689 @@ async fn serve<S:AsyncRead+AsyncWrite+Unpin+Send+'static>(mut socket:S,t:Arc<Ter
+             },
+         }}Ok(())
+     }.await;
+-    let _=t.close(id).await;result
++    if registry.is_some() {
++        let cleaned =
++            tokio::time::timeout(std::time::Duration::from_secs(5), cleanup.finish()).await;
++        let response = if matches!(cleaned, Ok(Ok(()))) {
++            Message::Closed
++        } else {
++            Message::Failure(match cleanup.owned() {
++                Some(id) => format!("Terminal cleanup pending: session_id={id}"),
++                None => "Terminal detach or ownership confirmation failed".into(),
++            })
++        };
++        let _ = write(&mut w, &response).await;
++        result
++    } else {
++        let _ = t.close(id).await;
++        result
++    }
+ }
++
+ struct Input(Mutex<tokio::net::unix::OwnedWriteHalf>);
+ #[async_trait::async_trait]
+ impl cli::TerminalInput for Input {
+-    async fn write(&self,_:u32,b:&[u8])->Result<(),String>{write(&mut *self.0.lock().await,&Message::Input(b.to_vec())).await}
+-    async fn resize(&self,_:u32,c:u16,r:u16)->Result<(),String>{write(&mut *self.0.lock().await,&Message::Resize(c,r)).await}
++    async fn write(&self, _: u32, b: &[u8]) -> Result<(), String> {
++        write(&mut *self.0.lock().await, &Message::Input(b.to_vec())).await
++    }
++
++    async fn resize(&self, _: u32, c: u16, r: u16) -> Result<(), String> {
++        write(&mut *self.0.lock().await, &Message::Resize(c, r)).await
++    }
+ }
+-pub async fn client(path:&Path,session:Option<u32>)->Result<(),String>{
+-    let mut socket=UnixStream::connect(path).await.map_err(|_|"Terminal list is no longer available")?;
+-    let(c,r)=cli::size();write(&mut socket,&Message::Open{session,cols:c,rows:r}).await?;
+-    let Message::Ready(id)=read(&mut socket).await? else{return Err("Local terminal open failed".into())};
+-    let(mut r,w)=socket.into_split();let input=Input(Mutex::new(w));let(tx,rx)=mpsc::channel(256);
+-    let worker=tokio::spawn(async move{loop{
+-        let event=match read(&mut r).await{Ok(Message::Output(data))=>Event::Output{session:id,data},Ok(Message::Exit(code))=>Event::Exit{session:id,code},_=>break};
+-        if tx.send(event).await.is_err(){break}
+-    }});
+-    let result=cli::terminal_loop(&input,rx,id).await;
+-    worker.abort();let _=worker.await;let _=write(&mut *input.0.lock().await,&Message::Close).await;result
++
++/// A headless broker owns one cloud connection; local clients exchange terminal
++/// frames only. Ownership remains in the outer registry if transport polling ends.
++pub async fn headless(
++    io: super::Transport,
++    rx: mpsc::Receiver<super::Packet>,
++    path: &Path,
++    registry: lifecycle::Registry,
++) -> Result<(), String> {
++    let (t, mut events) = Terminal::new(io, rx);
++    let t = Arc::new(t);
++    t.check_env().await?;
++    let server = Server::at(path)?;
++    let (output, _) = broadcast::channel(256);
++    let sender = output.clone();
++    let mut relay = super::Abort(tokio::spawn(async move {
++        while let Some(event) = events.recv().await {
++            let _ = sender.send(event);
++        }
++    }));
++    tokio::select! {
++        result=server.run_headless(t,output,registry)=>result,
++        _=&mut relay.0=>Err("Shared UU terminal transport ended".into()),
++    }
+ }
+ 
+-#[cfg(test)] mod tests {
++pub async fn client(path: &Path, session: Option<u32>) -> Result<(), String> {
++    let mut socket = UnixStream::connect(path)
++        .await
++        .map_err(|_| "Terminal list is no longer available")?;
++    let (c, r) = cli::size();
++    write(
++        &mut socket,
++        &Message::Open {
++            session,
++            cols: c,
++            rows: r,
++        },
++    )
++    .await?;
++    let (id, scoped, owned) = match read(&mut socket).await? {
++        Message::Ready(id) => (id, false, None),
++        Message::ReadyScoped { session, owned } => (session, true, owned),
++        Message::Failure(error) => return Err(error),
++        _ => return Err("Local terminal open failed".into()),
++    };
++    let (mut r, w) = socket.into_split();
++    let input = Input(Mutex::new(w));
++    let (tx, rx) = mpsc::channel(256);
++    let (closed, completion) = tokio::sync::oneshot::channel();
++    let worker = tokio::spawn(async move {
++        let mut closed = Some(closed);
++        loop {
++            let event = match read(&mut r).await {
++                Ok(Message::Output(data)) => Event::Output { session: id, data },
++                Ok(Message::Exit(code)) => Event::Exit { session: id, code },
++                Ok(Message::Error) => Event::Error { session: id },
++                Ok(Message::Closed) => {
++                    if let Some(done) = closed.take() {
++                        let _ = done.send(Ok(()));
++                    }
++                    break;
++                }
++                Ok(Message::Failure(error)) => {
++                    if let Some(done) = closed.take() {
++                        let _ = done.send(Err(error));
++                    }
++                    let _ = tx.send(Event::Error { session: id }).await;
++                    break;
++                }
++                _ => {
++                    let error = match owned {
++                        Some(id) => format!(
++                            "Shared UU connection ended; cleanup unconfirmed: session_id={id}"
++                        ),
++                        None => "Shared UU terminal connection ended".to_owned(),
++                    };
++                    if let Some(done) = closed.take() {
++                        let _ = done.send(Err(error));
++                    }
++                    let _ = tx.send(Event::Error { session: id }).await;
++                    break;
++                }
++            };
++            // The TTY reader may already be gone while we wait for the broker's
++            // cleanup acknowledgement. Continue draining that final response.
++            if tx.send(event).await.is_err() && !scoped {
++                break;
++            }
++        }
++    });
++    let result = cli::terminal_loop(&input, rx, id).await;
++    if !scoped {
++        worker.abort();
++        let _ = worker.await;
++        let _ = write(&mut *input.0.lock().await, &Message::Close).await;
++        return result;
++    }
++    let _ = tokio::time::timeout(
++        std::time::Duration::from_secs(2),
++        write(&mut *input.0.lock().await, &Message::Close),
++    )
++    .await;
++    let cleaned = tokio::time::timeout(std::time::Duration::from_secs(8), completion).await;
++    worker.abort();
++    let _ = worker.await;
++    match cleaned {
++        Ok(Ok(Ok(()))) => result,
++        Ok(Ok(Err(error))) => Err(error),
++        _ => Err(match owned {
++            Some(id) => format!("Terminal cleanup was not acknowledged: session_id={id}"),
++            None => "Terminal detach was not acknowledged".into(),
++        }),
++    }
++}
++
++#[cfg(test)]
++mod tests {
+     use super::*;
+     struct Mock(mpsc::Sender<super::super::Packet>);
+     #[async_trait::async_trait]
+     impl super::super::Send for Mock {
+-        async fn send(&self,c:usize,b:Vec<u8>)->Result<(),String>{self.0.send((c,b)).await.map_err(|_|"Mock closed".into())}
+-    }
+-    #[tokio::test] async fn two_local_ttys_share_one_terminal_and_close_independently(){
+-        tokio::time::timeout(std::time::Duration::from_secs(3),async{
+-            use super::super::{terminal as term,BINARY};
+-            let(tx,mut requests)=mpsc::channel(256);let(input,rx)=mpsc::channel(256);
+-            let(t,mut events)=Terminal::new(super::super::Transport(Arc::new(Mock(tx))),rx);let t=Arc::new(t);
+-            let(output,_)=broadcast::channel(256);let sender=output.clone();
+-            let _relay=super::super::Abort(tokio::spawn(async move{while let Some(e)=events.recv().await{let _=sender.send(e);}}));
+-            let(closed,mut closes)=mpsc::channel(8);
+-            let _host=super::super::Abort(tokio::spawn(async move{
+-                let mut next=40;
+-                while let Some((channel,b))=requests.recv().await{
+-                    assert_eq!(channel,BINARY);let f=term::Decoder::default().push(&b).unwrap().remove(0);
+-                    let reply=match f.kind{
+-                        term::OPEN=>{next+=1;term::encode(term::OPEN_RESP,next,br#"{"code":0}"#)},
+-                        term::STDIN=>term::encode(term::STDOUT,f.session,&f.payload),
+-                        term::CLOSE=>{closed.send(f.session).await.unwrap();continue},_=>panic!("Unexpected remote request"),
+-                    };input.send((BINARY,reply)).await.unwrap();
++        async fn send(&self, c: usize, b: Vec<u8>) -> Result<(), String> {
++            self.0.send((c, b)).await.map_err(|_| "Mock closed".into())
++        }
++    }
++
++    #[tokio::test]
++    async fn two_local_ttys_share_one_terminal_and_close_independently() {
++        tokio::time::timeout(std::time::Duration::from_secs(3), async {
++            use super::super::{terminal as term, BINARY};
++            let (tx, mut requests) = mpsc::channel(256);
++            let (input, rx) = mpsc::channel(256);
++            let (t, mut events) = Terminal::new(super::super::Transport(Arc::new(Mock(tx))), rx);
++            let t = Arc::new(t);
++            let (output, _) = broadcast::channel(256);
++            let sender = output.clone();
++            let _relay = super::super::Abort(tokio::spawn(async move {
++                while let Some(e) = events.recv().await {
++                    let _ = sender.send(e);
+                 }
+             }));
+-            let opening=Arc::new(Mutex::new(()));let active:Sessions=Default::default();let mut clients=Vec::new();let mut tasks=Vec::new();
+-            for _ in 0..2{
+-                let(mut client,server)=tokio::io::duplex(4096);
+-                let(t,opening,active,events)=(t.clone(),opening.clone(),active.clone(),output.subscribe());
+-                tasks.push(tokio::spawn(serve(server,t,opening,active,events)));
+-                write(&mut client,&Message::Open{session:None,cols:80,rows:24}).await.unwrap();
+-                let Message::Ready(id)=read(&mut client).await.unwrap()else{panic!()};clients.push((client,id));
++            let (closed, mut closes) = mpsc::channel(8);
++            let _host = super::super::Abort(tokio::spawn(async move {
++                let mut next = 40;
++                while let Some((channel, b)) = requests.recv().await {
++                    assert_eq!(channel, BINARY);
++                    let f = term::Decoder::default().push(&b).unwrap().remove(0);
++                    let reply = match f.kind {
++                        term::OPEN => {
++                            next += 1;
++                            term::encode(term::OPEN_RESP, next, br#"{"code":0}"#)
++                        }
++                        term::STDIN => term::encode(term::STDOUT, f.session, &f.payload),
++                        term::CLOSE => {
++                            closed.send(f.session).await.unwrap();
++                            continue;
++                        }
++                        _ => panic!("Unexpected remote request"),
++                    };
++                    input.send((BINARY, reply)).await.unwrap();
++                }
++            }));
++            let opening = Arc::new(Mutex::new(()));
++            let active: Sessions = Default::default();
++            let mut clients = Vec::new();
++            let mut tasks = Vec::new();
++            for _ in 0..2 {
++                let (mut client, server) = tokio::io::duplex(4096);
++                let (t, opening, active, events) = (
++                    t.clone(),
++                    opening.clone(),
++                    active.clone(),
++                    output.subscribe(),
++                );
++                tasks.push(tokio::spawn(serve(
++                    server, t, opening, active, events, None,
++                )));
++                write(
++                    &mut client,
++                    &Message::Open {
++                        session: None,
++                        cols: 80,
++                        rows: 24,
++                    },
++                )
++                .await
++                .unwrap();
++                let Message::Ready(id) = read(&mut client).await.unwrap() else {
++                    panic!()
++                };
++                clients.push((client, id));
+             }
+-            let(mut first,id)=clients.remove(0);write(&mut first,&Message::Close).await.unwrap();
+-            assert_eq!(closes.recv().await.unwrap(),id);tasks.remove(0).await.unwrap().unwrap();
+-            let(mut second,id)=clients.remove(0);
++            let (mut first, id) = clients.remove(0);
++            write(&mut first, &Message::Close).await.unwrap();
++            assert_eq!(closes.recv().await.unwrap(), id);
++            tasks.remove(0).await.unwrap().unwrap();
++            let (mut second, id) = clients.remove(0);
+             // Split an incoming frame while remote output is ready: the reader must retain framing.
+-            let b=serde_json::to_vec(&Message::Input(vec![0,255,27])).unwrap();second.write_u32(b.len() as u32).await.unwrap();second.write_all(&b[..2]).await.unwrap();
+-            assert!(output.send(Event::Output{session:id,data:b"synthetic".to_vec()}).is_ok());
++            let b = serde_json::to_vec(&Message::Input(vec![0, 255, 27])).unwrap();
++            second.write_u32(b.len() as u32).await.unwrap();
++            second.write_all(&b[..2]).await.unwrap();
++            assert!(output
++                .send(Event::Output {
++                    session: id,
++                    data: b"synthetic".to_vec()
++                })
++                .is_ok());
+             assert!(matches!(read(&mut second).await,Ok(Message::Output(b))if b==b"synthetic"));
+             second.write_all(&b[2..]).await.unwrap();
+             assert!(matches!(read(&mut second).await,Ok(Message::Output(b))if b==[0,255,27]));
+-            drop(second);assert_eq!(closes.recv().await.unwrap(),id);tasks.remove(0).await.unwrap().unwrap_err();
++            drop(second);
++            assert_eq!(closes.recv().await.unwrap(), id);
++            tasks.remove(0).await.unwrap().unwrap_err();
+             assert!(active.lock().unwrap().is_empty());
+-        }).await.unwrap();
++        })
++        .await
++        .unwrap();
+     }
+-    #[tokio::test] async fn framing_rejects_oversize_before_payload(){
+-        let(mut a,mut b)=tokio::io::duplex(64);a.write_u32(MAX as u32+1).await.unwrap();
++
++    #[tokio::test]
++    async fn framing_rejects_oversize_before_payload() {
++        let (mut a, mut b) = tokio::io::duplex(64);
++        a.write_u32(MAX as u32 + 1).await.unwrap();
+         assert!(read(&mut b).await.err().unwrap().contains("limit"));
+     }
+-    #[tokio::test] async fn framing_roundtrips_binary_and_detects_truncation(){
+-        let(mut a,mut b)=tokio::io::duplex(256);
+-        write(&mut a,&Message::Input(vec![0,255,27])).await.unwrap();
++
++    #[tokio::test]
++    async fn framing_roundtrips_binary_and_detects_truncation() {
++        let (mut a, mut b) = tokio::io::duplex(256);
++        write(&mut a, &Message::Input(vec![0, 255, 27]))
++            .await
++            .unwrap();
+         assert!(matches!(read(&mut b).await,Ok(Message::Input(v))if v==[0,255,27]));
+-        a.write_u32(30).await.unwrap();drop(a);assert!(read(&mut b).await.is_err());
++        a.write_u32(30).await.unwrap();
++        drop(a);
++        assert!(read(&mut b).await.is_err());
++    }
++
++    /// Replace the remote host with a small in-memory TERM registry. The real
++    /// decoder, pending RPC routing, IPC framing and ownership cleanup remain.
++    struct ScopedFixture {
++        terminal: Arc<Terminal>,
++
++        output: broadcast::Sender<Event>,
++
++        opening: Arc<Mutex<()>>,
++
++        active: Sessions,
++
++        registry: lifecycle::Registry,
++
++        /// Only operation kinds and ids are recorded; no terminal contents.
++        trace: Arc<std::sync::Mutex<Vec<(u8, u32)>>>,
++
++        /// The preexisting session 7 must survive every owned-client cleanup.
++        remote: Arc<std::sync::Mutex<std::collections::BTreeSet<u32>>>,
++
++        _relay: super::super::Abort<()>,
++
++        _host: super::super::Abort<()>,
++    }
++
++    impl ScopedFixture {
++        fn new(legacy: bool) -> Self {
++            use super::super::{terminal as term, BINARY};
++            let (tx, mut requests) = mpsc::channel(256);
++            let (input, rx) = mpsc::channel(256);
++            let (t, mut events) = Terminal::new(super::super::Transport(Arc::new(Mock(tx))), rx);
++            let terminal = Arc::new(t);
++            let (output, _) = broadcast::channel(256);
++            let sender = output.clone();
++            let relay = super::super::Abort(tokio::spawn(async move {
++                while let Some(event) = events.recv().await {
++                    let _ = sender.send(event);
++                }
++            }));
++            let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
++            let recorded = trace.clone();
++            let remote = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::from([7])));
++            let sessions = remote.clone();
++            let host = super::super::Abort(tokio::spawn(async move {
++                let mut next = 9;
++                while let Some((channel, data)) = requests.recv().await {
++                    assert_eq!(channel, BINARY);
++                    let frame = term::Decoder::default().push(&data).unwrap().remove(0);
++                    recorded.lock().unwrap().push((frame.kind, frame.session));
++                    let response = match frame.kind {
++                        term::LIST_REQ => {
++                            let rows: Vec<_> = sessions
++                                .lock()
++                                .unwrap()
++                                .iter()
++                                .map(|id| serde_json::json!({"session_id":id}))
++                                .collect();
++                            term::encode(
++                                term::LIST_RESP,
++                                frame.session,
++                                serde_json::to_string(&rows).unwrap().as_bytes(),
++                            )
++                        }
++                        term::OPEN => {
++                            let id = if frame.session == 0 {
++                                let id = next;
++                                next += 1;
++                                id
++                            } else {
++                                frame.session
++                            };
++                            sessions.lock().unwrap().insert(id);
++                            term::encode(
++                                term::OPEN_RESP,
++                                if legacy { 0 } else { id },
++                                br#"{"code":0}"#,
++                            )
++                        }
++                        term::STDIN => term::encode(term::STDOUT, frame.session, &frame.payload),
++                        term::KILL_REQ => {
++                            sessions.lock().unwrap().remove(&frame.session);
++                            term::encode(term::KILL_RESP, frame.session, br#"{"code":0}"#)
++                        }
++                        term::DETACH => continue,
++                        _ => panic!("unexpected scoped terminal request"),
++                    };
++                    if input.send((BINARY, response)).await.is_err() {
++                        break;
++                    }
++                }
++            }));
++            Self {
++                terminal,
++                output,
++                opening: Arc::new(Mutex::new(())),
++                active: Default::default(),
++                registry: Default::default(),
++                trace,
++                remote,
++                _relay: relay,
++                _host: host,
++            }
++        }
++
++        /// Simulate one local TTY using real asynchronous IPC frames.
++        async fn open(
++            &self,
++            session: Option<u32>,
++        ) -> (
++            tokio::io::DuplexStream,
++            tokio::task::JoinHandle<Result<(), String>>,
++            Message,
++        ) {
++            let (mut client, socket) = tokio::io::duplex(16384);
++            let (t, opening, active, events, registry) = (
++                self.terminal.clone(),
++                self.opening.clone(),
++                self.active.clone(),
++                self.output.subscribe(),
++                self.registry.clone(),
++            );
++            let task = tokio::spawn(serve(socket, t, opening, active, events, Some(registry)));
++            write(
++                &mut client,
++                &Message::Open {
++                    session,
++                    cols: 80,
++                    rows: 24,
++                },
++            )
++            .await
++            .unwrap();
++            let ready = read(&mut client).await.unwrap();
++            (client, task, ready)
++        }
++    }
++
++    /// Simultaneous clients are opened serially on one transport. Closing or
++    /// losing one client deletes only its owned id and acknowledges that cleanup.
++    #[tokio::test]
++    async fn shared_clients_open_and_clean_up_independently() {
++        tokio::time::timeout(std::time::Duration::from_secs(3), async {
++            use super::super::terminal as term;
++            let fixture = ScopedFixture::new(false);
++            let (first, second) = tokio::join!(fixture.open(None), fixture.open(None));
++            let (mut first, first_task, first_ready) = first;
++            let (mut second, second_task, second_ready) = second;
++            let Message::ReadyScoped {
++                session: first_id,
++                owned: Some(first_owned),
++            } = first_ready
++            else {
++                panic!("missing ownership")
++            };
++            let Message::ReadyScoped {
++                session: second_id,
++                owned: Some(second_owned),
++            } = second_ready
++            else {
++                panic!("missing ownership")
++            };
++            assert_ne!(first_id, second_id);
++            assert_eq!(first_id, first_owned);
++            assert_eq!(second_id, second_owned);
++
++            write(&mut first, &Message::Close).await.unwrap();
++            assert!(matches!(read(&mut first).await, Ok(Message::Closed)));
++            first_task.await.unwrap().unwrap();
++            assert!(!fixture.remote.lock().unwrap().contains(&first_id));
++            write(&mut second, &Message::Input(vec![0, 255, 27]))
++                .await
++                .unwrap();
++            assert!(matches!(read(&mut second).await,Ok(Message::Output(data))if data==[0,255,27]));
++
++            drop(second);
++            second_task.await.unwrap().unwrap_err();
++            assert_eq!(
++                *fixture.remote.lock().unwrap(),
++                std::collections::BTreeSet::from([7])
++            );
++            let kills: Vec<_> = fixture
++                .trace
++                .lock()
++                .unwrap()
++                .iter()
++                .filter(|(kind, _)| *kind == term::KILL_REQ)
++                .map(|(_, id)| *id)
++                .collect();
++            assert_eq!(kills, vec![first_id, second_id]);
++            assert!(fixture
++                .registry
++                .entries()
++                .iter()
++                .all(|entry| entry.owned().is_none()));
++        })
++        .await
++        .unwrap();
++    }
++
++    /// The existing-session route must send DETACH, preserving user work even
++    /// when it shares the same broker as terminals created by another task.
++    #[tokio::test]
++    async fn shared_existing_session_is_detached_without_kill() {
++        tokio::time::timeout(std::time::Duration::from_secs(2), async {
++            use super::super::terminal as term;
++            let fixture = ScopedFixture::new(false);
++            let (mut client, task, ready) = fixture.open(Some(7)).await;
++            assert!(matches!(
++                ready,
++                Message::ReadyScoped {
++                    session: 7,
++                    owned: None
++                }
++            ));
++            write(&mut client, &Message::Close).await.unwrap();
++            assert!(matches!(read(&mut client).await, Ok(Message::Closed)));
++            task.await.unwrap().unwrap();
++            assert!(fixture.remote.lock().unwrap().contains(&7));
++            let trace = fixture.trace.lock().unwrap();
++            assert!(trace.contains(&(term::DETACH, 7)));
++            assert!(!trace
++                .iter()
++                .any(|(kind, _)| *kind == term::KILL_REQ || *kind == term::CLOSE));
++        })
++        .await
++        .unwrap();
++    }
++
++    /// Legacy hosts returning wire id zero cannot route two concurrent output
++    /// streams. Reject the second client before sending another OPEN.
++    #[tokio::test]
++    async fn legacy_wire_zero_refuses_a_second_client_without_open() {
++        tokio::time::timeout(std::time::Duration::from_secs(2), async {
++            use super::super::terminal as term;
++            let fixture = ScopedFixture::new(true);
++            let (mut first, first_task, ready) = fixture.open(None).await;
++            assert!(matches!(
++                ready,
++                Message::ReadyScoped {
++                    session: 0,
++                    owned: Some(9)
++                }
++            ));
++            let (_second, second_task, ready) = fixture.open(None).await;
++            assert!(matches!(ready, Message::Failure(_)));
++            second_task.await.unwrap().unwrap_err();
++            assert_eq!(
++                fixture
++                    .trace
++                    .lock()
++                    .unwrap()
++                    .iter()
++                    .filter(|(kind, _)| *kind == term::OPEN)
++                    .count(),
++                1
++            );
++            write(&mut first, &Message::Close).await.unwrap();
++            assert!(matches!(read(&mut first).await, Ok(Message::Closed)));
++            first_task.await.unwrap().unwrap();
++        })
++        .await
++        .unwrap();
++    }
++
++    /// A transport failure cancels client I/O, but its registry entry must still
++    /// let the outer connection scope confirm and delete that client's shell.
++    #[tokio::test]
++    async fn aborted_client_keeps_ownership_for_outer_cleanup() {
++        tokio::time::timeout(std::time::Duration::from_secs(2), async {
++            let fixture = ScopedFixture::new(false);
++            let (_client, task, ready) = fixture.open(None).await;
++            let Message::ReadyScoped {
++                owned: Some(id), ..
++            } = ready
++            else {
++                panic!("missing ownership")
++            };
++            task.abort();
++            assert!(task.await.unwrap_err().is_cancelled());
++            for entry in fixture.registry.entries() {
++                entry.finish().await.unwrap();
++            }
++            assert!(!fixture.remote.lock().unwrap().contains(&id));
++            assert!(fixture.remote.lock().unwrap().contains(&7));
++        })
++        .await
++        .unwrap();
++    }
++
++    /// Ping, list and explicit termination are management operations; none may
++    /// allocate a shell while a terminal is already using the shared transport.
++    #[tokio::test]
++    async fn shared_management_does_not_open_a_terminal() {
++        tokio::time::timeout(std::time::Duration::from_secs(2),async {
++            use super::super::terminal as term;
++            let fixture=ScopedFixture::new(false);
++            for message in [Message::Ping,Message::List,Message::Kill(vec![7,99])] {
++                let(mut client,socket)=tokio::io::duplex(4096);
++                let(t,opening,active,events,registry)=(fixture.terminal.clone(),fixture.opening.clone(),fixture.active.clone(),fixture.output.subscribe(),fixture.registry.clone());
++                let task=tokio::spawn(serve(socket,t,opening,active,events,Some(registry)));
++                write(&mut client,&message).await.unwrap();
++                match message {
++                    Message::Ping=>assert!(matches!(read(&mut client).await,Ok(Message::Pong(1)))),
++                    Message::List=>assert!(matches!(read(&mut client).await,Ok(Message::Sessions(rows))if rows.len()==1)),
++                    Message::Kill(_)=>assert!(matches!(read(&mut client).await,Ok(Message::Killed(ids))if ids==[7,99])),
++                    _=>unreachable!(),
++                }
++                task.await.unwrap().unwrap();
++            }
++            assert!(!fixture.trace.lock().unwrap().iter().any(|(kind,_)|*kind==term::OPEN));
++            assert!(fixture.remote.lock().unwrap().is_empty());
++        }).await.unwrap();
++    }
++
++    /// Short private socket paths keep these kernel IPC tests portable to macOS.
++    struct SocketDirectory(PathBuf);
++
++    impl SocketDirectory {
++        fn new() -> Self {
++            use std::os::unix::fs::DirBuilderExt;
++            let base = if cfg!(target_os = "macos") {
++                PathBuf::from("/private/tmp")
++            } else {
++                std::env::temp_dir()
++            };
++            let path = base.join(format!("uu-ipc-test-{}", super::super::super::wire::uuid()));
++            std::fs::DirBuilder::new()
++                .mode(0o700)
++                .create(&path)
++                .unwrap();
++            Self(path)
++        }
++    }
++
++    impl Drop for SocketDirectory {
++        fn drop(&mut self) {
++            let _ = std::fs::remove_dir_all(&self.0);
++        }
++    }
++
++    /// An active attachment keeps the broker alive. Removing the last client
++    /// starts the idle deadline and releases its socket without ending old work.
++    #[tokio::test]
++    async fn broker_waits_for_active_clients_then_stops_when_idle() {
++        tokio::time::timeout(std::time::Duration::from_secs(2), async {
++            let directory = SocketDirectory::new();
++            let path = directory.0.join("tty");
++            let server = Server::at(&path).unwrap();
++            let fixture = ScopedFixture::new(false);
++            let task = tokio::spawn(server.run_headless_idle(
++                fixture.terminal.clone(),
++                fixture.output.clone(),
++                fixture.registry.clone(),
++                std::time::Duration::from_millis(30),
++            ));
++            let mut client = UnixStream::connect(&path).await.unwrap();
++            write(
++                &mut client,
++                &Message::Open {
++                    session: None,
++                    cols: 80,
++                    rows: 24,
++                },
++            )
++            .await
++            .unwrap();
++            assert!(matches!(
++                read(&mut client).await,
++                Ok(Message::ReadyScoped { owned: Some(_), .. })
++            ));
++
++            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
++            assert!(
++                !task.is_finished(),
++                "an active client must prevent idle shutdown"
++            );
++            write(&mut client, &Message::Close).await.unwrap();
++            assert!(matches!(read(&mut client).await, Ok(Message::Closed)));
++            task.await.unwrap().unwrap();
++
++            assert!(
++                !path.exists(),
++                "idle shutdown must remove the listening socket"
++            );
++            assert_eq!(
++                *fixture.remote.lock().unwrap(),
++                std::collections::BTreeSet::from([7])
++            );
++        })
++        .await
++        .unwrap();
++    }
++
++    /// Never overwrite user files or bind a terminal socket in a directory that
++    /// another account can enter; failed validation must leave paths unchanged.
++    #[tokio::test]
++    async fn broker_socket_rejects_unsafe_paths_without_modifying_them() {
++        use std::os::unix::fs::{symlink, PermissionsExt};
++        let directory = SocketDirectory::new();
++        let path = directory.0.join("tty");
++        std::fs::write(&path, b"synthetic user file").unwrap();
++        assert!(Server::at(&path).is_err());
++        assert_eq!(std::fs::read(&path).unwrap(), b"synthetic user file");
++        std::fs::remove_file(&path).unwrap();
++
++        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o755)).unwrap();
++        assert!(Server::at(&path).is_err());
++        assert!(!path.exists());
++        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
++        let link = directory.0.join("link");
++        symlink(&directory.0, &link).unwrap();
++        assert!(Server::at(&link.join("tty")).is_err());
++        assert!(std::fs::symlink_metadata(&link)
++            .unwrap()
++            .file_type()
++            .is_symlink());
+     }
+ }
 diff --git a/src/viewer/tools/tests.rs b/src/viewer/tools/tests.rs
 index 3696fe4b8e459517c562060ac9dd4ffad097b3c3..e46c7fdc9d6aea0fd8ee198b8f76afda63a2a090 100644
 --- a/src/viewer/tools/tests.rs
@@ -1227,7 +2476,7 @@ index 3696fe4b8e459517c562060ac9dd4ffad097b3c3..e46c7fdc9d6aea0fd8ee198b8f76afda
 +    assert!(out.recv().await.is_none(),"the local detach key must not be sent as STDIN");
 +}
 diff --git a/src/viewer_main.rs b/src/viewer_main.rs
-index 06c3c35dca506161c6f18baf6dd773ba9d5621f6..b92ab7e878f40f8f3b6cc8372bc9a64b335a0841 100644
+index 06c3c35dca506161c6f18baf6dd773ba9d5621f6..402f878b06613bf945fd7a1a477e217586fff787 100644
 --- a/src/viewer_main.rs
 +++ b/src/viewer_main.rs
 @@ -15,7 +15,7 @@ use viewer::clipboard;
@@ -1239,13 +2488,14 @@ index 06c3c35dca506161c6f18baf6dd773ba9d5621f6..b92ab7e878f40f8f3b6cc8372bc9a64b
  const DEFAULT_SHAPE:&str=r#"{"capture_type":1,"platform":3,"client_version":"4.42.0","width":1920,"height":1080,"fps":60,"chroma":1,
   "decoders":[{"fps":60,"codec":1,"width":3840,"height":2160,"chroma":1}],"display_modes":[[1920,1080,60]],
   "displays":[{"id":1,"fps":60,"type":0,"hdr":0}],
-@@ -26,8 +26,17 @@ async fn main() {
+@@ -26,10 +26,50 @@ async fn main() {
      // Do not inherit broad RUST_LOG filters that could expose third-party wire diagnostics.
      let args:Vec<String>=std::env::args().skip(1).collect();
      // The terminal tool owns the TTY: diagnostics would interleave with the remote shell's screen.
 -    let level=if args.first().is_some_and(|m|matches!(m.as_str(),"terminal"|"terminal-local")){log::LevelFilter::Off}else{log::LevelFilter::Info};
 -    env_logger::Builder::new().filter_level(log::LevelFilter::Off).filter_module("uuremote_viewer",level).init();
-+    let level=if args.first().is_some_and(|m|matches!(m.as_str(),"terminal"|"terminal-local"|"terminal-list"|"terminal-kill")){log::LevelFilter::Off}else{log::LevelFilter::Info};
+-    match run(&args).await {Ok(())=>{},Err(error)=>{eprintln!("{error}");std::process::exit(2)}}
++    let level=if args.first().is_some_and(|m|matches!(m.as_str(),"terminal"|"terminal-local"|"terminal-list"|"terminal-kill"|"terminal-server")){log::LevelFilter::Off}else{log::LevelFilter::Info};
 +    let mut logger=env_logger::Builder::new();
 +    logger.filter_level(log::LevelFilter::Off).filter_module("uuremote_viewer",level);
 +    // Opt-in terminal diagnostics use an explicit module allowlist. Never enable
@@ -1256,19 +2506,52 @@ index 06c3c35dca506161c6f18baf6dd773ba9d5621f6..b92ab7e878f40f8f3b6cc8372bc9a64b
 +        }
 +    }
 +    logger.init();
-     match run(&args).await {Ok(())=>{},Err(error)=>{eprintln!("{error}");std::process::exit(2)}}
++    if std::env::var("UU_TERMINAL_DIRECT").as_deref()!=Ok("1") {
++        if let Some(mut command)=terminal_launcher(&args) {
++            use std::os::unix::process::CommandExt;
++            let _=command.exec();
++            eprintln!("Cannot start the shared terminal launcher");
++            std::process::exit(2)
++        }
++    }
++    match run(&args).await {Ok(())=>{},Err(error)=>{use std::io::Write;let _=writeln!(std::io::stderr(),"{error}");std::process::exit(2)}}
  }
++
++/// Keep existing terminal commands compatible while routing all normal use
++/// through one per-device broker. Direct cloud connections require an explicit
++/// diagnostic opt-in because another Socket.IO connection can evict a live one.
++fn terminal_launcher(args:&[String])->Option<std::process::Command> {
++    let mode=args.first()?.as_str();
++    let mut options=Vec::new();
++    match mode {
++        "terminal" if args.len()==2=>{},
++        "terminal" if args.len()==3 && args[2].parse::<u32>().is_ok_and(|id|id!=0)=>options.extend(["--session".to_owned(),args[2].clone()]),
++        "terminal-list" if args.len()==2=>options.push("--list".to_owned()),
++        "terminal-kill" if args.len()>=3 && args[2..].iter().all(|value|value.parse::<u32>().is_ok_and(|id|id!=0))=>{
++            options.push("--kill".to_owned());options.extend_from_slice(&args[2..]);
++        },
++        _=>return None,
++    }
++    let executable=std::env::current_exe().ok()?;
++    let script=executable.parent()?.parent()?.join("scripts/terminal.py");
++    let mut command=std::process::Command::new("/usr/bin/python3");
++    command.arg(script).args(["--device",&args[1]]).args(options);
++    Some(command)
++}
++
  async fn run(args:&[String])->Result<(),String> {
-@@ -67,7 +76,7 @@ async fn run(args:&[String])->Result<(),String> {
+     match args.first().map(String::as_str) {
+         None|Some("--help"|"help")=>{println!("{HELP}");Ok(())},
+@@ -67,7 +107,7 @@ async fn run(args:&[String])->Result<(),String> {
              let session=if args.len()==3{Some(args[2].parse::<u32>().ok().filter(|n|*n!=0).ok_or("Invalid terminal session id")?)}else{None};
              viewer::tools::terminal_ipc::client(std::path::Path::new(&args[1]),session).await
          },
 -        Some("terminal"|"files"|"portmap"|"files-ui"|"portmap-ui"|"terminal-ui")=>tool_command(args).await,
-+        Some("terminal"|"terminal-list"|"terminal-kill"|"files"|"portmap"|"files-ui"|"portmap-ui"|"terminal-ui")=>tool_command(args).await,
++        Some("terminal"|"terminal-list"|"terminal-kill"|"terminal-server"|"files"|"portmap"|"files-ui"|"portmap-ui"|"terminal-ui")=>tool_command(args).await,
          Some("assist") if args.len()==2=> {
              let code=viewer::assist::read_code(std::io::stdin().lock())?;
              desktop_command(&["connect".into(),args[1].clone(),"false".into(),"-".into(),"echo".into(),"legacy".into()],Some(code)).await.map_err(|e|crate::tr!("协助连接失败：{e}","Assistance connection failed: {e}"))
-@@ -218,7 +227,7 @@ mod cli_tests {
+@@ -218,7 +258,7 @@ mod cli_tests {
      use super::*;
      #[tokio::test]
      async fn invalid_commands_never_fall_through_to_login_or_host_service() {
@@ -1277,72 +2560,120 @@ index 06c3c35dca506161c6f18baf6dd773ba9d5621f6..b92ab7e878f40f8f3b6cc8372bc9a64b
              assert!(run(&args.into_iter().map(str::to_owned).collect::<Vec<_>>()).await.is_err());
          }
      }
-@@ -257,8 +266,12 @@ mod cli_tests {
+@@ -257,8 +297,24 @@ mod cli_tests {
  }
  
  async fn tool_command(args:&[String])->Result<(),String>{
 -    let capture=match args[0].as_str(){"terminal" if args.len()==2 || args.len()==3=>8,"terminal-ui" if args.len()==3=>8,"files" if (args.len()==4 && args[2]=="ls") || (args.len()==5 && ["get","put"].contains(&args[2].as_str()))=>5,"portmap" if args.len()==5=>9,"files-ui" if args.len()==3=>5,"portmap-ui" if args.len()==3=>9,_=>return Err(HELP.into())};
-+    let capture=match args[0].as_str(){"terminal" if args.len()==2 || args.len()==3=>8,"terminal-list" if args.len()==2=>8,"terminal-kill" if args.len()>=3=>8,"terminal-ui" if args.len()==3=>8,"files" if (args.len()==4 && args[2]=="ls") || (args.len()==5 && ["get","put"].contains(&args[2].as_str()))=>5,"portmap" if args.len()==5=>9,"files-ui" if args.len()==3=>5,"portmap-ui" if args.len()==3=>9,_=>return Err(HELP.into())};
++    let capture=match args[0].as_str(){"terminal" if args.len()==2 || args.len()==3=>8,"terminal-list" if args.len()==2=>8,"terminal-kill" if args.len()>=3=>8,"terminal-server" if args.len()==3=>8,"terminal-ui" if args.len()==3=>8,"files" if (args.len()==4 && args[2]=="ls") || (args.len()==5 && ["get","put"].contains(&args[2].as_str()))=>5,"portmap" if args.len()==5=>9,"files-ui" if args.len()==3=>5,"portmap-ui" if args.len()==3=>9,_=>return Err(HELP.into())};
      let terminal_session=if args[0]=="terminal" && args.len()==3{Some(args[2].parse::<u32>().ok().filter(|n|*n!=0).ok_or("Invalid terminal session id")?)}else{None};
 +    let terminal_kill=if args[0]=="terminal-kill" {
 +        args[2..].iter().map(|value|value.parse::<u32>().ok().filter(|id|*id!=0).ok_or("Invalid terminal session id"))
 +            .collect::<Result<Vec<_>,_>>()?
 +    } else {Vec::new()};
++    let _broker_lock=if args[0]=="terminal-server" {
++        use std::os::{fd::FromRawFd,unix::fs::MetadataExt};
++        if !std::path::Path::new(&args[2]).is_absolute(){return Err("Invalid shared terminal socket path".into())}
++        let fd=std::env::var("UU_TERMINAL_LOCK_FD").ok().and_then(|value|value.parse::<i32>().ok()).filter(|fd|*fd>=3).ok_or("Start the shared terminal with scripts/terminal.py")?;
++        if unsafe{libc::fcntl(fd,libc::F_GETFD)}<0{return Err("Shared terminal lock was not inherited".into())}
++        let file=unsafe{std::fs::File::from_raw_fd(fd)};
++        let metadata=file.metadata().map_err(|_|"Cannot inspect shared terminal lock")?;
++        if !metadata.is_file() || metadata.uid()!=unsafe{libc::geteuid()} || metadata.mode()&0o077!=0 || unsafe{libc::flock(fd,libc::LOCK_EX|libc::LOCK_NB)}!=0 {
++            return Err("Shared terminal lock is not private or owned".into())
++        }
++        Some(file)
++    } else {None};
      #[cfg(not(uu_gtk))] if args[0].ends_with("-ui"){return Err("Tool windows require the GTK build".into())}
      let ports=if args[0]=="portmap"{Some((args[2].parse::<u16>().map_err(|_|"Invalid local port")?,args[4].parse::<u16>().map_err(|_|"Invalid target port")?))}else{None};
      if ports.is_some_and(|(_,port)|port==0) || (args[0]=="portmap" && args[3].trim().is_empty()){return Err("Invalid forwarding target".into())}
-@@ -270,13 +283,16 @@ async fn tool_command(args:&[String])->Result<(),String>{
+@@ -270,23 +326,87 @@ async fn tool_command(args:&[String])->Result<(),String>{
      // Match the existing UI connection framing (9bb42d5); the host tolerates this prefix.
      let options=Options{timeout:Duration::from_secs(12),legacy_prefix:true,ready_policy:ReadyPolicy::EchoOnly,clipboard:clipboard::Bridge::new(false)};
      let mut session=Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()).await?;
 +    let cleanup=viewer::tools::lifecycle::Cleanup::default();
++    let registry=viewer::tools::lifecycle::Registry::default();
      let result=async{
          let(io,rx)=viewer::tools::attach(&session.peer)?;
-         let ready=async{
-             loop{if session.peer.channels.iter().enumerate().filter(|(i,_)|[0,if capture==8{4}else{3}].contains(i)).all(|(_,c)|c.ready_state()==webrtc::data_channel::data_channel_state::RTCDataChannelState::Open) && session.peer.observed.echo_received.load(std::sync::atomic::Ordering::Acquire){break}tokio::select!{r=session.step()=>r?,_=tokio::time::sleep(Duration::from_millis(20))=>{}}}Ok::<_,String>(())
-         };
-         tokio::time::timeout(Duration::from_secs(30),ready).await.map_err(|_|"Tool connection timed out")??;
+-        let ready=async{
+-            loop{if session.peer.channels.iter().enumerate().filter(|(i,_)|[0,if capture==8{4}else{3}].contains(i)).all(|(_,c)|c.ready_state()==webrtc::data_channel::data_channel_state::RTCDataChannelState::Open) && session.peer.observed.echo_received.load(std::sync::atomic::Ordering::Acquire){break}tokio::select!{r=session.step()=>r?,_=tokio::time::sleep(Duration::from_millis(20))=>{}}}Ok::<_,String>(())
+-        };
+-        tokio::time::timeout(Duration::from_secs(30),ready).await.map_err(|_|"Tool connection timed out")??;
 -        let operation=async{match args[0].as_str(){"terminal"=>viewer::tools::cli::terminal(io,rx,terminal_session).await,"files"=>viewer::tools::cli::files(io,rx,&args[2..]).await,
-+        let operation=async{match args[0].as_str(){"terminal"=>viewer::tools::cli::terminal(io,rx,terminal_session,cleanup.clone()).await,
++        let channels=session.peer.channels.clone();
++        let observed=session.peer.observed.clone();
++        let heartbeat_io=io.clone();
++        let operation=async{
++            let ready=async {
++                loop {
++                    if channels.iter().enumerate().filter(|(i,_)|[0,if capture==8{4}else{3}].contains(i))
++                        .all(|(_,channel)|channel.ready_state()==webrtc::data_channel::data_channel_state::RTCDataChannelState::Open)
++                        && observed.echo_received.load(std::sync::atomic::Ordering::Acquire){return}
++                    tokio::time::sleep(Duration::from_millis(20)).await;
++                }
++            };
++            tokio::time::timeout(Duration::from_secs(30),ready).await.map_err(|_|"Tool connection timed out")?;
++            match args[0].as_str(){"terminal"=>viewer::tools::cli::terminal(io,rx,terminal_session,cleanup.clone()).await,
 +            "terminal-list"=>viewer::tools::cli::terminal_manage(io,rx,&[]).await,
 +            "terminal-kill"=>viewer::tools::cli::terminal_manage(io,rx,&terminal_kill).await,"files"=>viewer::tools::cli::files(io,rx,&args[2..]).await,
++            "terminal-server"=>viewer::tools::terminal_ipc::headless(io,rx,std::path::Path::new(&args[2]),registry.clone()).await,
              #[cfg(uu_gtk)] "terminal-ui"=>viewer::tools_ui::terminal(io,rx,&args[1],&args[2]).await,
              #[cfg(uu_gtk)] "files-ui"=>viewer::tools_ui::files(io,rx,&args[2]).await,
              #[cfg(uu_gtk)] "portmap-ui"=>viewer::tools_ui::portmap(io,rx,&args[2]).await,
-@@ -284,9 +300,39 @@ async fn tool_command(args:&[String])->Result<(),String>{
+             "portmap"=>{let(local,port)=ports.unwrap();viewer::tools::cli::portmap(io,rx,local,&args[3],port).await}
              _=>Err("Tool windows require the GTK build".into())}};
-         tokio::pin!(operation);
+-        tokio::pin!(operation);
          let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;
 -        loop{tokio::select!{r=&mut operation=>break r,r=session.step()=>r?,_=terminate.recv()=>break Ok(()),_=tokio::signal::ctrl_c()=>break Ok(())}}
 +        let mut hangup=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).map_err(|_|"Cannot watch terminal hangup")?;
 +        // Official Windows hosts require CONTROL heartbeats for tool peers too.
 +        // Match the existing desktop loop so idle text terminals stay connected.
-+        let mut heartbeat=tokio::time::interval(Duration::from_secs(1));
-+        loop{tokio::select!{r=&mut operation=>break r,r=session.step()=>r?,
-+            _=heartbeat.tick()=>if session.peer.observed.control_open.load(std::sync::atomic::Ordering::Acquire){session.peer.send_input(&viewer::input::Input::heartbeat()).await?;},
-+            _=terminate.recv()=>break Ok(()),_=hangup.recv()=>break Ok(()),_=tokio::signal::ctrl_c()=>break Ok(())}}
++        let heartbeat=async {
++            let mut interval=tokio::time::interval(Duration::from_secs(1));
++            loop {
++                interval.tick().await;
++                if observed.control_open.load(std::sync::atomic::Ordering::Acquire) {
++                    heartbeat_io.send(viewer::tools::CONTROL,viewer::input::Input::heartbeat().to_string().into_bytes()).await?;
++                }
++            }
++        };
++        let signaling=async {loop {session.step().await?;}};
++        let stopped=async {tokio::select!{_=terminate.recv()=>{},_=hangup.recv()=>{},_=tokio::signal::ctrl_c()=>{}}};
++        viewer::session::drive_tools(operation,signaling,heartbeat,stopped).await
      }.await;
 -    session.close().await;result
 +    // The terminal future has now been dropped and restored its TTY. Cleanup
 +    // still owns the protocol worker, so even an outer signaling error cannot
 +    // skip KILL for the remote shell created by this invocation.
-+    let cleaned=tokio::time::timeout(Duration::from_secs(5),cleanup.finish()).await;
-+    session.close().await;
-+    let mut cleanup_error=None;
-+    if !matches!(cleaned,Ok(Ok(()))) {
-+        if let Some(id)=cleanup.owned() {
-+            // If signaling also closed the old data channels, reconnect only
-+            // the management path. It never sends OPEN or creates a shell.
-+            let reap=vec!["terminal-kill".into(),args[1].clone(),id.to_string()];
-+            if matches!(tokio::time::timeout(Duration::from_secs(20),Box::pin(tool_command(&reap))).await,Ok(Ok(()))) {
-+                cleanup.complete();
-+            } else {
-+                cleanup_error=Some(format!("Remote terminal cleanup pending: session_id={id}"));
-+            }
-+        } else {
-+            cleanup_error=Some("Remote terminal cleanup could not confirm ownership; no existing session was terminated.".to_owned());
++    let mut cleanups=vec![cleanup];
++    cleanups.extend(registry.entries());
++    let mut pending=Vec::new();
++    let mut unconfirmed=false;
++    let results=futures_util::future::join_all(cleanups.iter().map(|cleanup|async {
++        tokio::time::timeout(Duration::from_secs(5),cleanup.finish()).await
++    })).await;
++    for (cleanup,finished) in cleanups.iter().zip(results) {
++        if !matches!(finished,Ok(Ok(()))) {
++            if let Some(id)=cleanup.owned(){pending.push(id)}else{unconfirmed=true;}
 +        }
 +    }
++    let _=tokio::time::timeout(Duration::from_secs(3),session.close()).await;
++    let mut cleanup_error=None;
++    if !pending.is_empty() {
++        if args[0]!="terminal-server" {
++            // If signaling also closed the old data channels, reconnect only
++            // the management path. It never sends OPEN or creates a shell.
++            let mut reap=vec!["terminal-kill".into(),args[1].clone()];
++            reap.extend(pending.iter().map(u32::to_string));
++            if matches!(tokio::time::timeout(Duration::from_secs(20),Box::pin(tool_command(&reap))).await,Ok(Ok(()))) {
++                for cleanup in &cleanups{cleanup.complete();}
++                pending.clear();
++            }
++        }
++        // A shared broker may have been displaced by the official client.
++        // Rejoining here could evict that client again, so report pending ids.
++        if !pending.is_empty(){cleanup_error=Some(format!("Remote terminal cleanup pending: session_ids={pending:?}"));}
++    }
++    if unconfirmed && cleanup_error.is_none(){cleanup_error=Some("Remote terminal cleanup could not confirm ownership; no existing session was terminated.".to_owned());}
 +    match (result,cleanup_error) {
 +        (Ok(()),Some(error))=>Err(error),
 +        (Err(error),Some(cleanup))=>Err(format!("{error}; {cleanup}")),
